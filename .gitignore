@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+MP3/
+*.wav
+*.mp3
+tools/ffmpeg-master-latest-linux64-gpl*/
+tools/*.xz
+tools/*.tar*
+*.log
+.env
+.vscode/
+.idea/
+.DS_Store
