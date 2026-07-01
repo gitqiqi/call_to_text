@@ -1,0 +1,19 @@
+# 核心依赖
+psycopg2-binary>=2.9.11
+pandas>=3.0.0
+pydub>=0.25.1
+openai-whisper>=20250625
+funasr>=1.3.14
+modelscope>=1.37.1
+torchaudio>=2.11.0
+
+# 工具
+requests
+python-dotenv
+snownlp
+zhconv
+pymysql
+
+# 系统需要额外安装: ffmpeg
+# macOS: brew install ffmpeg
+# Ubuntu: apt-get install ffmpeg
