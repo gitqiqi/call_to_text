@@ -1,3 +1,8 @@
+import ssl
+import certifi
+
+ssl._create_default_https_context = ssl.create_default_context(cafile=certifi.where())
+
 from datetime import datetime, timedelta
 import psycopg2
 import psycopg2.extras
