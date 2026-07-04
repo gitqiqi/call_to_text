@@ -234,17 +234,15 @@ for _, row in df.iterrows():
         (id, voice_id, from_id, receive_id, msg_type, msg_time, voice_length,
          content, voice_url, left_channel_text, right_channel_text,
          all_channel_text, transcribe_start_time, transcribe_end_time, model)
-        SELECT
-        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-        WHERE NOT EXISTS (
-            SELECT 1 FROM bi.call_to_text WHERE id = %s
-        )
+        VALUES
+        (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (id) DO NOTHING
     """
 
         params = (
             row_id, voice_id, from_id, receive_id, msg_type, msg_time,
             voice_length, content, url, text1, text2, text,
-            transcribe_start_time, transcribe_end_time, model_name, row_id
+            transcribe_start_time, transcribe_end_time, model_name
         )
 
         cursor.execute(insert_sql, params)
