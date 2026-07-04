@@ -236,7 +236,21 @@ for _, row in df.iterrows():
          all_channel_text, transcribe_start_time, transcribe_end_time, model)
         VALUES
         (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (id) DO NOTHING
+        ON CONFLICT (id) DO UPDATE SET
+            voice_id = EXCLUDED.voice_id,
+            from_id = EXCLUDED.from_id,
+            receive_id = EXCLUDED.receive_id,
+            msg_type = EXCLUDED.msg_type,
+            msg_time = EXCLUDED.msg_time,
+            voice_length = EXCLUDED.voice_length,
+            content = EXCLUDED.content,
+            voice_url = EXCLUDED.voice_url,
+            left_channel_text = EXCLUDED.left_channel_text,
+            right_channel_text = EXCLUDED.right_channel_text,
+            all_channel_text = EXCLUDED.all_channel_text,
+            transcribe_start_time = EXCLUDED.transcribe_start_time,
+            transcribe_end_time = EXCLUDED.transcribe_end_time,
+            model = EXCLUDED.model
     """
 
         params = (
