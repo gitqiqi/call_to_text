@@ -8,6 +8,15 @@ def create_certifi_https_context():
 ssl._create_default_https_context = create_certifi_https_context
 
 from datetime import datetime, timedelta
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+model_dir = os.getenv('ASR_MODEL_DIR', '')
+if model_dir:
+    os.environ.setdefault('MODELSCOPE_CACHE', model_dir)
+
 import psycopg2
 import psycopg2.extras
 import pandas as pd
@@ -22,12 +31,8 @@ import warnings
 import requests
 from requests.adapters import HTTPAdapter
 import tempfile
-import os
 import re
 import time
-from dotenv import load_dotenv
-
-load_dotenv()
 
 warnings.filterwarnings('ignore')
 
@@ -42,10 +47,6 @@ def env_bool(name, default=False):
     if value is None:
         return default
     return value.strip().lower() in ('1', 'true', 'yes', 'y', 'on')
-
-model_dir = os.getenv('ASR_MODEL_DIR', '')
-if model_dir:
-    os.environ.setdefault('MODELSCOPE_CACHE', model_dir)
 
 RUN_LIMIT = env_int('RUN_LIMIT', 0)
 INSERT_BATCH_SIZE = max(env_int('INSERT_BATCH_SIZE', 100), 1)
@@ -395,7 +396,6 @@ elif ASR_MODEL == 'paraformer':
 elif ASR_MODEL in ('sensevoice', 'sensevoice-small', 'sensevoicesmall'):
     sensevoice_model = AutoModel(
         model="iic/SenseVoiceSmall",
-        trust_remote_code=True,
         vad_model="fsmn-vad",
         vad_kwargs={"max_single_segment_time": 30000},
         disable_update=True,
