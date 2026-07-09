@@ -85,3 +85,12 @@ wait
 ```
 
 如果是 CPU 跑，先从 2 个分片开始；如果是 GPU 跑，通常单进程或少量分片更稳，避免显存被多进程抢满。
+
+## 数据库字段
+
+脚本会写入每条音频的转写耗时，单位毫秒：
+
+```sql
+ALTER TABLE bi.call_to_text
+ADD COLUMN IF NOT EXISTS transcribe_duration_ms bigint;
+```

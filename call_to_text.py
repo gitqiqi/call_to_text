@@ -480,9 +480,10 @@ insert_sql = """
 INSERT INTO bi.call_to_text
 (id, voice_id, from_id, receive_id, msg_type, msg_time, voice_length,
  content, voice_url, left_channel_text, right_channel_text,
- all_channel_text, transcribe_start_time, transcribe_end_time, model)
+ all_channel_text, transcribe_start_time, transcribe_end_time,
+ transcribe_duration_ms, model)
 VALUES
-(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (id) DO UPDATE SET
     voice_id = EXCLUDED.voice_id,
     from_id = EXCLUDED.from_id,
@@ -497,6 +498,7 @@ ON CONFLICT (id) DO UPDATE SET
     all_channel_text = EXCLUDED.all_channel_text,
     transcribe_start_time = EXCLUDED.transcribe_start_time,
     transcribe_end_time = EXCLUDED.transcribe_end_time,
+    transcribe_duration_ms = EXCLUDED.transcribe_duration_ms,
     model = EXCLUDED.model
 """
 
@@ -542,13 +544,15 @@ for _, row in df.iterrows():
         downloaded_file(url, audio_path)
         stereo_audio = AudioSegment.from_file(audio_path, format="mp3")
         transcribe_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        transcribe_perf_start = time.perf_counter()
         text1, text2, text = result_texts(stereo_audio, row_id)
+        transcribe_duration_ms = int((time.perf_counter() - transcribe_perf_start) * 1000)
         transcribe_end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         params = (
             row_id, voice_id, from_id, receive_id, msg_type, msg_time,
             voice_length, content, url, text1, text2, text,
-            transcribe_start_time, transcribe_end_time, model_name
+            transcribe_start_time, transcribe_end_time, transcribe_duration_ms, model_name
         )
 
         pending_rows.append(params)
