@@ -279,6 +279,18 @@ def funasr_segments_from_result(result, clean_text=lambda text: text.strip()):
                 append_segment(segments, 0, 0, text)
     return {"segments": segments}
 
+def generate_with_timestamp_fallback(model, generate_kwargs):
+    try:
+        return model.generate(**generate_kwargs)
+    except KeyError as e:
+        missing_key = str(e).strip("'\"")
+        if missing_key != 'timestamp' or not generate_kwargs.get('output_timestamp'):
+            raise
+        fallback_kwargs = generate_kwargs.copy()
+        fallback_kwargs.pop('output_timestamp', None)
+        fallback_kwargs.pop('sentence_timestamp', None)
+        return model.generate(**fallback_kwargs)
+
 def transcribe_by_whisper_segments(audio_path, segment_transcriber):
     ws_result = whisper_timestamp_model.transcribe(audio_path)
     ws_segments = ws_result.get('segments', [])
@@ -388,8 +400,7 @@ elif ASR_MODEL == 'paraformer':
             generate_kwargs['hotword'] = ASR_HOTWORDS
         if ASR_OUTPUT_TIMESTAMP:
             generate_kwargs['output_timestamp'] = True
-            generate_kwargs['sentence_timestamp'] = True
-        pf_result = paraformer_model.generate(**generate_kwargs)
+        pf_result = generate_with_timestamp_fallback(paraformer_model, generate_kwargs)
         if ASR_OUTPUT_TIMESTAMP:
             return funasr_segments_from_result(pf_result)
         return format_plain_text_as_single_segment(funasr_text_from_result(pf_result))
@@ -437,7 +448,7 @@ elif ASR_MODEL in ('sensevoice', 'sensevoice-small', 'sensevoicesmall'):
             generate_kwargs['hotwords'] = ASR_HOTWORD_LIST
         if ASR_OUTPUT_TIMESTAMP:
             generate_kwargs['output_timestamp'] = True
-        sv_result = sensevoice_model.generate(**generate_kwargs)
+        sv_result = generate_with_timestamp_fallback(sensevoice_model, generate_kwargs)
         if ASR_OUTPUT_TIMESTAMP:
             return funasr_segments_from_result(sv_result, clean_sensevoice_text)
         text = funasr_text_from_result(sv_result, clean_sensevoice_text)
