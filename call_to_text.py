@@ -55,13 +55,19 @@ DOWNLOAD_RETRIES = max(env_int('DOWNLOAD_RETRIES', 3), 1)
 KEEP_AUDIO = env_bool('KEEP_AUDIO', False)
 PROGRESS_EVERY = max(env_int('PROGRESS_EVERY', 0), 0)
 LOG_RECORDS = env_bool('LOG_RECORDS', False)
+LOG_STAGES = env_bool('LOG_STAGES', True)
 ASR_OUTPUT_TIMESTAMP = env_bool('ASR_OUTPUT_TIMESTAMP', True)
 ASR_MAX_SEGMENT_CHARS = max(env_int('ASR_MAX_SEGMENT_CHARS', 80), 10)
 ASR_MAX_SEGMENT_SECONDS = max(env_int('ASR_MAX_SEGMENT_SECONDS', 20), 5)
+PARAFORMER_PUNC = env_bool('PARAFORMER_PUNC', True)
 SHARD_COUNT = max(env_int('SHARD_COUNT', 1), 1)
 SHARD_INDEX = env_int('SHARD_INDEX', 0)
 if SHARD_COUNT > 1 and not 0 <= SHARD_INDEX < SHARD_COUNT:
     raise SystemExit(f"SHARD_INDEX 必须在 0 到 {SHARD_COUNT - 1} 之间")
+
+def log_stage(message):
+    if LOG_STAGES:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {message}", flush=True)
 
 db_host = os.getenv('DB_HOLOGRES_HOST')
 db_name = os.getenv('DB_HOLOGRES_DATABASE', 'db')
@@ -70,6 +76,7 @@ db_password = os.getenv('DB_HOLOGRES_PASSWORD')
 db_port = int(os.getenv('DB_HOLOGRES_PORT', 80))
 
 try:
+    log_stage('连接数据库')
     conn = psycopg2.connect(
         host=db_host,
         port=db_port,
@@ -126,7 +133,9 @@ params = [day, SHARD_COUNT, SHARD_COUNT, SHARD_INDEX]
 if RUN_LIMIT > 0:
     sql += " limit %s"
     params.append(RUN_LIMIT)
+log_stage('查询待处理音频')
 df = pd.read_sql_query(sql, conn, params=tuple(params))
+log_stage(f'待处理音频数量: {len(df)}')
 
 http_session = requests.Session()
 http_session.mount('http://', HTTPAdapter(pool_connections=16, pool_maxsize=16))
@@ -373,14 +382,18 @@ if ASR_MODEL == 'whisper':
     def transcribe(audio_path):
         return model.transcribe(audio_path)
 elif ASR_MODEL == 'paraformer':
-    paraformer_model = AutoModel(
-        model="iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
-        vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-        punc_model="iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
-        disable_update=True,
-        disable_pbar=True,
-        **model_kwargs_with_optional_device(),
-    )
+    log_stage('加载 Paraformer 模型')
+    paraformer_kwargs = {
+        'model': "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        'vad_model': "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+        'disable_update': True,
+        'disable_pbar': True,
+    }
+    if PARAFORMER_PUNC:
+        paraformer_kwargs['punc_model'] = "iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch"
+    paraformer_kwargs = model_kwargs_with_optional_device(**paraformer_kwargs)
+    paraformer_model = AutoModel(**paraformer_kwargs)
+    log_stage('Paraformer 模型加载完成')
     whisper_timestamp_model = None
     if ASR_SEGMENT_MODE == 'whisper':
         whisper_timestamp_model = whisper.load_model("tiny", download_root=os.getenv('ASR_MODEL_DIR'))
@@ -405,6 +418,7 @@ elif ASR_MODEL == 'paraformer':
             return funasr_segments_from_result(pf_result)
         return format_plain_text_as_single_segment(funasr_text_from_result(pf_result))
 elif ASR_MODEL in ('sensevoice', 'sensevoice-small', 'sensevoicesmall'):
+    log_stage('加载 SenseVoiceSmall 模型')
     sensevoice_model = AutoModel(
         model="iic/SenseVoiceSmall",
         vad_model="fsmn-vad",
@@ -413,6 +427,7 @@ elif ASR_MODEL in ('sensevoice', 'sensevoice-small', 'sensevoicesmall'):
         disable_pbar=True,
         **model_kwargs_with_optional_device(),
     )
+    log_stage('SenseVoiceSmall 模型加载完成')
     whisper_timestamp_model = None
     if ASR_SEGMENT_MODE == 'whisper':
         whisper_timestamp_model = whisper.load_model("tiny", download_root=os.getenv('ASR_MODEL_DIR'))
@@ -459,6 +474,7 @@ else:
 processed = 0
 failed = 0
 pending_rows = []
+log_stage('开始处理音频')
 
 insert_sql = """
 INSERT INTO bi.call_to_text

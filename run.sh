@@ -31,6 +31,8 @@ docker run --rm \
   -e KEEP_AUDIO="$KEEP_AUDIO" \
   -e PROGRESS_EVERY="$PROGRESS_EVERY" \
   -e LOG_RECORDS="$LOG_RECORDS" \
+  -e LOG_STAGES="$LOG_STAGES" \
+  -e PARAFORMER_PUNC="$PARAFORMER_PUNC" \
   -e ASR_MODEL_DIR=/app/models \
   -v "$(pwd)/models:/app/models" \
   -v "$(pwd)/MP3:/app/MP3" \

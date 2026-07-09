@@ -45,7 +45,11 @@ RUN_LIMIT=0
 
 # 运行日志。默认不输出每条记录/进度；需要观察时再打开
 LOG_RECORDS=0
+LOG_STAGES=1
 PROGRESS_EVERY=0
+
+# Paraformer 是否加载标点模型。设为 0 可更快启动，但输出标点会差一些
+PARAFORMER_PUNC=1
 
 # 分片并行。单进程保持 1/0；多进程时 SHARD_INDEX 从 0 到 SHARD_COUNT-1
 SHARD_COUNT=1
