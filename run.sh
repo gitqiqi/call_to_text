@@ -3,7 +3,11 @@ set -e
 
 cd "$(dirname "$0")"
 
-export $(grep -v '^\s*#' .env | grep -v '^\s*$' | xargs)
+if [ -f .env ]; then
+  set -a
+  . ./.env
+  set +a
+fi
 
 docker run --rm \
   -e DB_HOLOGRES_HOST="$DB_HOLOGRES_HOST" \
@@ -13,6 +17,20 @@ docker run --rm \
   -e DB_HOLOGRES_DATABASE="$DB_HOLOGRES_DATABASE" \
   -e ASR_MODEL="$ASR_MODEL" \
   -e WHISPER_MODEL="$WHISPER_MODEL" \
+  -e ASR_SEGMENT_MODE="$ASR_SEGMENT_MODE" \
+  -e ASR_OUTPUT_TIMESTAMP="$ASR_OUTPUT_TIMESTAMP" \
+  -e ASR_MAX_SEGMENT_CHARS="$ASR_MAX_SEGMENT_CHARS" \
+  -e ASR_MAX_SEGMENT_SECONDS="$ASR_MAX_SEGMENT_SECONDS" \
+  -e ASR_HOTWORDS="$ASR_HOTWORDS" \
+  -e ASR_DEVICE="$ASR_DEVICE" \
+  -e SENSEVOICE_LANGUAGE="$SENSEVOICE_LANGUAGE" \
+  -e INSERT_BATCH_SIZE="$INSERT_BATCH_SIZE" \
+  -e RUN_LIMIT="$RUN_LIMIT" \
+  -e SHARD_COUNT="$SHARD_COUNT" \
+  -e SHARD_INDEX="$SHARD_INDEX" \
+  -e KEEP_AUDIO="$KEEP_AUDIO" \
+  -e PROGRESS_EVERY="$PROGRESS_EVERY" \
+  -e LOG_RECORDS="$LOG_RECORDS" \
   -e ASR_MODEL_DIR=/app/models \
   -v "$(pwd)/models:/app/models" \
   -v "$(pwd)/MP3:/app/MP3" \

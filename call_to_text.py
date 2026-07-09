@@ -14,19 +14,53 @@ import pandas as pd
 from pydub import AudioSegment
 import whisper
 from funasr import AutoModel
+try:
+    from funasr.utils.postprocess_utils import rich_transcription_postprocess
+except ImportError:
+    rich_transcription_postprocess = None
 import warnings
 import requests
+from requests.adapters import HTTPAdapter
 import tempfile
 import os
+import re
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
 
 warnings.filterwarnings('ignore')
 
+def env_int(name, default):
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+def env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+
 model_dir = os.getenv('ASR_MODEL_DIR', '')
 if model_dir:
     os.environ.setdefault('MODELSCOPE_CACHE', model_dir)
+
+RUN_LIMIT = env_int('RUN_LIMIT', 0)
+INSERT_BATCH_SIZE = max(env_int('INSERT_BATCH_SIZE', 100), 1)
+DOWNLOAD_CHUNK_SIZE = max(env_int('DOWNLOAD_CHUNK_SIZE', 1024 * 1024), 1024)
+DOWNLOAD_RETRIES = max(env_int('DOWNLOAD_RETRIES', 3), 1)
+KEEP_AUDIO = env_bool('KEEP_AUDIO', False)
+PROGRESS_EVERY = max(env_int('PROGRESS_EVERY', 0), 0)
+LOG_RECORDS = env_bool('LOG_RECORDS', False)
+ASR_OUTPUT_TIMESTAMP = env_bool('ASR_OUTPUT_TIMESTAMP', True)
+ASR_MAX_SEGMENT_CHARS = max(env_int('ASR_MAX_SEGMENT_CHARS', 80), 10)
+ASR_MAX_SEGMENT_SECONDS = max(env_int('ASR_MAX_SEGMENT_SECONDS', 20), 5)
+SHARD_COUNT = max(env_int('SHARD_COUNT', 1), 1)
+SHARD_INDEX = env_int('SHARD_INDEX', 0)
+if SHARD_COUNT > 1 and not 0 <= SHARD_INDEX < SHARD_COUNT:
+    raise SystemExit(f"SHARD_INDEX 必须在 0 到 {SHARD_COUNT - 1} 之间")
 
 db_host = os.getenv('DB_HOLOGRES_HOST')
 db_name = os.getenv('DB_HOLOGRES_DATABASE', 'db')
@@ -78,24 +112,41 @@ content::jsonb -> 'meetingVoiceCall' ->> 'ossUrl' AS meet_url,
 from book.we_chat_data w
 WHERE  msg_type in ('meeting_voice_call','voice')
 and date(msg_time)=%s
+and (%s = 1 or mod(abs(hashtext(id::text)), %s) = %s)
 and not exists (
     select 1
     from bi.call_to_text ctt
     where ctt.id = w.id
 )
 )t
+order by msg_time
 """
-df = pd.read_sql_query(sql, conn, params=(day,))
+params = [day, SHARD_COUNT, SHARD_COUNT, SHARD_INDEX]
+if RUN_LIMIT > 0:
+    sql += " limit %s"
+    params.append(RUN_LIMIT)
+df = pd.read_sql_query(sql, conn, params=tuple(params))
 
+http_session = requests.Session()
+http_session.mount('http://', HTTPAdapter(pool_connections=16, pool_maxsize=16))
+http_session.mount('https://', HTTPAdapter(pool_connections=16, pool_maxsize=16))
 
 def downloaded_file(url,host):
-    response = requests.get(url, stream=True, timeout=300)
-    response.raise_for_status()
-    with open(host, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=1024):
-            if chunk:
-                f.write(chunk)
-    print("文件下载成功")
+    last_error = None
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        try:
+            response = http_session.get(url, stream=True, timeout=300)
+            response.raise_for_status()
+            with open(host, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                    if chunk:
+                        f.write(chunk)
+            return
+        except Exception as e:
+            last_error = e
+            if attempt < DOWNLOAD_RETRIES:
+                time.sleep(min(2 ** attempt, 10))
+    raise last_error
 
 
 def merge_segments(left_segs, right_segs):
@@ -123,6 +174,143 @@ def format_merged_segments_list(result_list):
         # 注意：合并后的话段多了 'channel' 字段
         lines.append(f"[{seg['start']:.1f}s-{seg['end']:.1f}s] [{seg['channel']}]: {seg['text']}")
     return "\n".join(lines)
+
+def clean_sensevoice_text(text):
+    if not text:
+        return ''
+    if rich_transcription_postprocess is None:
+        return text.strip()
+    return rich_transcription_postprocess(text).strip()
+
+def hotword_list():
+    if not ASR_HOTWORDS:
+        return []
+    return [word for word in re.split(r'[\s,，]+', ASR_HOTWORDS) if word]
+
+def format_plain_text_as_single_segment(text):
+    text = text.strip()
+    if not text:
+        return {"segments": []}
+    return {"segments": [{"start": 0, "end": 0, "text": text}]}
+
+def ms_to_seconds(value):
+    return round(float(value) / 1000, 3)
+
+def funasr_text_from_result(result, clean_text=lambda text: text.strip()):
+    if not result:
+        return ''
+    texts = []
+    for item in result:
+        text = clean_text(item.get('text', ''))
+        if text:
+            texts.append(text)
+    return "\n".join(texts)
+
+def append_segment(segments, start_ms, end_ms, text):
+    text = text.strip()
+    if not text:
+        return
+    segments.append({
+        'start': ms_to_seconds(start_ms),
+        'end': ms_to_seconds(max(end_ms, start_ms)),
+        'text': text,
+    })
+
+def segments_from_timestamp_words(item, clean_text=lambda text: text.strip()):
+    timestamps = item.get('timestamp') or []
+    words = item.get('words') or []
+    if not timestamps or not words or len(timestamps) != len(words):
+        return []
+
+    segments = []
+    sentence_enders = set('。！？!?；;')
+    soft_enders = set('，,、')
+    max_duration_ms = ASR_MAX_SEGMENT_SECONDS * 1000
+    start_ms = None
+    end_ms = None
+    text_parts = []
+
+    for word, timestamp in zip(words, timestamps):
+        if not word or not isinstance(timestamp, (list, tuple)) or len(timestamp) < 2:
+            continue
+        token_start_ms, token_end_ms = timestamp[0], timestamp[1]
+        if start_ms is None:
+            start_ms = token_start_ms
+        end_ms = token_end_ms
+        text_parts.append(word)
+        text = ''.join(text_parts)
+        should_flush = (
+            word in sentence_enders
+            or (word in soft_enders and len(text) >= ASR_MAX_SEGMENT_CHARS // 2)
+            or len(text) >= ASR_MAX_SEGMENT_CHARS
+            or end_ms - start_ms >= max_duration_ms
+        )
+        if should_flush:
+            append_segment(segments, start_ms, end_ms, clean_text(text))
+            start_ms = None
+            end_ms = None
+            text_parts = []
+
+    if text_parts and start_ms is not None and end_ms is not None:
+        append_segment(segments, start_ms, end_ms, clean_text(''.join(text_parts)))
+    return segments
+
+def segments_from_sentence_info(item, clean_text=lambda text: text.strip()):
+    segments = []
+    for seg in item.get('sentence_info') or []:
+        text = clean_text(seg.get('sentence') or seg.get('text') or '')
+        start = seg.get('start', 0)
+        end = seg.get('end', start)
+        append_segment(segments, start, end, text)
+    return segments
+
+def funasr_segments_from_result(result, clean_text=lambda text: text.strip()):
+    segments = []
+    for item in result or []:
+        item_segments = segments_from_sentence_info(item, clean_text)
+        if not item_segments:
+            item_segments = segments_from_timestamp_words(item, clean_text)
+        if item_segments:
+            segments.extend(item_segments)
+        else:
+            text = clean_text(item.get('text', ''))
+            if text:
+                append_segment(segments, 0, 0, text)
+    return {"segments": segments}
+
+def transcribe_by_whisper_segments(audio_path, segment_transcriber):
+    ws_result = whisper_timestamp_model.transcribe(audio_path)
+    ws_segments = ws_result.get('segments', [])
+    if not ws_segments:
+        text = segment_transcriber(audio_path)
+        if text:
+            return {"segments": [{"start": 0, "end": 0, "text": text}]}
+        return {"segments": []}
+
+    audio = AudioSegment.from_file(audio_path, format="wav")
+    segments = []
+    for seg in ws_segments:
+        start_ms = int(seg['start'] * 1000)
+        end_ms = int(seg['end'] * 1000)
+        if end_ms - start_ms < 300:
+            continue
+        seg_audio = audio[start_ms:end_ms]
+        if len(seg_audio) < 100:
+            continue
+        tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        seg_audio.export(tmp_path, format="wav")
+        try:
+            text = segment_transcriber(tmp_path)
+        except Exception:
+            text = ''
+        finally:
+            os.unlink(tmp_path)
+        if text.strip():
+            segments.append({'start': seg['start'], 'end': seg['end'], 'text': text})
+
+    return {"segments": segments}
 
 def result_texts(audios, record_id):
     host_path = 'MP3/'
@@ -154,10 +342,21 @@ def result_texts(audios, record_id):
 
 
 ASR_MODEL = os.getenv('ASR_MODEL', 'whisper').lower()
+ASR_HOTWORDS = os.getenv('ASR_HOTWORDS', '').strip()
+ASR_HOTWORD_LIST = hotword_list()
+ASR_DEVICE = os.getenv('ASR_DEVICE', '').strip()
+ASR_SEGMENT_MODE = os.getenv('ASR_SEGMENT_MODE', 'fast').lower()
+SENSEVOICE_LANGUAGE = os.getenv('SENSEVOICE_LANGUAGE', 'zh').strip() or 'zh'
+
+def model_kwargs_with_optional_device(**kwargs):
+    if ASR_DEVICE:
+        kwargs['device'] = ASR_DEVICE
+    return kwargs
 
 if ASR_MODEL == 'whisper':
-    model = whisper.load_model("base", download_root=os.getenv('ASR_MODEL_DIR'))
-    model_name = 'whisper-base'
+    whisper_model_name = os.getenv('WHISPER_MODEL', 'base')
+    model = whisper.load_model(whisper_model_name, download_root=os.getenv('ASR_MODEL_DIR'))
+    model_name = f'whisper-{whisper_model_name}'
     def transcribe(audio_path):
         return model.transcribe(audio_path)
 elif ASR_MODEL == 'paraformer':
@@ -166,47 +365,136 @@ elif ASR_MODEL == 'paraformer':
         vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
         punc_model="iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
         disable_update=True,
+        disable_pbar=True,
+        **model_kwargs_with_optional_device(),
     )
-    whisper_timestamp_model = whisper.load_model("tiny", download_root=os.getenv('ASR_MODEL_DIR'))
+    whisper_timestamp_model = None
+    if ASR_SEGMENT_MODE == 'whisper':
+        whisper_timestamp_model = whisper.load_model("tiny", download_root=os.getenv('ASR_MODEL_DIR'))
     model_name = 'paraformer-large'
+    def transcribe_paraformer_segment(segment_path):
+        generate_kwargs = {'input': segment_path}
+        if ASR_HOTWORDS:
+            generate_kwargs['hotword'] = ASR_HOTWORDS
+        pf_result = paraformer_model.generate(**generate_kwargs)
+        return pf_result[0].get('text', '') if pf_result else ''
+
     def transcribe(audio_path):
-        ws_result = whisper_timestamp_model.transcribe(audio_path)
-        ws_segments = ws_result.get('segments', [])
-        if not ws_segments:
-            pf_result = paraformer_model.generate(input=audio_path)
-            if not pf_result:
-                return {"segments": []}
-            text = pf_result[0].get('text', '')
-            if text:
-                return {"segments": [{"start": 0, "end": 0, "text": text}]}
-            return {"segments": []}
+        if ASR_SEGMENT_MODE == 'whisper':
+            return transcribe_by_whisper_segments(audio_path, transcribe_paraformer_segment)
+        generate_kwargs = {'input': audio_path, 'batch_size_s': 300}
+        if ASR_HOTWORDS:
+            generate_kwargs['hotword'] = ASR_HOTWORDS
+        if ASR_OUTPUT_TIMESTAMP:
+            generate_kwargs['output_timestamp'] = True
+            generate_kwargs['sentence_timestamp'] = True
+        pf_result = paraformer_model.generate(**generate_kwargs)
+        if ASR_OUTPUT_TIMESTAMP:
+            return funasr_segments_from_result(pf_result)
+        return format_plain_text_as_single_segment(funasr_text_from_result(pf_result))
+elif ASR_MODEL in ('sensevoice', 'sensevoice-small', 'sensevoicesmall'):
+    sensevoice_model = AutoModel(
+        model="iic/SenseVoiceSmall",
+        trust_remote_code=True,
+        vad_model="fsmn-vad",
+        vad_kwargs={"max_single_segment_time": 30000},
+        disable_update=True,
+        disable_pbar=True,
+        **model_kwargs_with_optional_device(),
+    )
+    whisper_timestamp_model = None
+    if ASR_SEGMENT_MODE == 'whisper':
+        whisper_timestamp_model = whisper.load_model("tiny", download_root=os.getenv('ASR_MODEL_DIR'))
+    model_name = 'sensevoice-small'
+    def transcribe_sensevoice_segment(segment_path):
+        generate_kwargs = {
+            'input': segment_path,
+            'cache': {},
+            'language': SENSEVOICE_LANGUAGE,
+            'use_itn': True,
+            'batch_size_s': 60,
+            'merge_vad': True,
+            'merge_length_s': 15,
+        }
+        if ASR_HOTWORD_LIST:
+            generate_kwargs['hotwords'] = ASR_HOTWORD_LIST
+        sv_result = sensevoice_model.generate(**generate_kwargs)
+        return clean_sensevoice_text(sv_result[0].get('text', '')) if sv_result else ''
 
-        audio = AudioSegment.from_file(audio_path, format="wav")
-        segments = []
-        for seg in ws_segments:
-            start_ms = int(seg['start'] * 1000)
-            end_ms = int(seg['end'] * 1000)
-            if end_ms - start_ms < 300:
-                continue
-            seg_audio = audio[start_ms:end_ms]
-            if len(seg_audio) < 100:
-                continue
-            tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-            seg_audio.export(tmp.name, format="wav")
-            try:
-                pf_result = paraformer_model.generate(input=tmp.name)
-                text = pf_result[0].get('text', '') if pf_result else ''
-            except Exception:
-                text = ''
-            os.unlink(tmp.name)
-            segments.append({'start': seg['start'], 'end': seg['end'], 'text': text})
-
-        segments = [s for s in segments if s['text'].strip()]
-        if segments:
-            return {"segments": segments}
-        return {"segments": []}
+    def transcribe(audio_path):
+        if ASR_SEGMENT_MODE == 'whisper':
+            return transcribe_by_whisper_segments(audio_path, transcribe_sensevoice_segment)
+        generate_kwargs = {
+            'input': audio_path,
+            'cache': {},
+            'language': SENSEVOICE_LANGUAGE,
+            'use_itn': True,
+            'batch_size_s': 300,
+            'merge_vad': True,
+            'merge_length_s': 15,
+        }
+        if ASR_HOTWORD_LIST:
+            generate_kwargs['hotwords'] = ASR_HOTWORD_LIST
+        if ASR_OUTPUT_TIMESTAMP:
+            generate_kwargs['output_timestamp'] = True
+        sv_result = sensevoice_model.generate(**generate_kwargs)
+        if ASR_OUTPUT_TIMESTAMP:
+            return funasr_segments_from_result(sv_result, clean_sensevoice_text)
+        text = funasr_text_from_result(sv_result, clean_sensevoice_text)
+        return format_plain_text_as_single_segment(text)
+else:
+    raise SystemExit(f"不支持的 ASR_MODEL: {ASR_MODEL}")
 
 processed = 0
+failed = 0
+pending_rows = []
+
+insert_sql = """
+INSERT INTO bi.call_to_text
+(id, voice_id, from_id, receive_id, msg_type, msg_time, voice_length,
+ content, voice_url, left_channel_text, right_channel_text,
+ all_channel_text, transcribe_start_time, transcribe_end_time, model)
+VALUES
+(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+ON CONFLICT (id) DO UPDATE SET
+    voice_id = EXCLUDED.voice_id,
+    from_id = EXCLUDED.from_id,
+    receive_id = EXCLUDED.receive_id,
+    msg_type = EXCLUDED.msg_type,
+    msg_time = EXCLUDED.msg_time,
+    voice_length = EXCLUDED.voice_length,
+    content = EXCLUDED.content,
+    voice_url = EXCLUDED.voice_url,
+    left_channel_text = EXCLUDED.left_channel_text,
+    right_channel_text = EXCLUDED.right_channel_text,
+    all_channel_text = EXCLUDED.all_channel_text,
+    transcribe_start_time = EXCLUDED.transcribe_start_time,
+    transcribe_end_time = EXCLUDED.transcribe_end_time,
+    model = EXCLUDED.model
+"""
+
+def flush_pending_rows():
+    global processed, pending_rows
+    if not pending_rows:
+        return
+    rows = pending_rows
+    pending_rows = []
+    try:
+        psycopg2.extras.execute_batch(cursor, insert_sql, rows, page_size=INSERT_BATCH_SIZE)
+        conn.commit()
+        processed += len(rows)
+    except Exception as batch_error:
+        conn.rollback()
+        print(f"批量写入失败，回退单条写入: {batch_error}")
+        for params in rows:
+            try:
+                cursor.execute(insert_sql, params)
+                conn.commit()
+                processed += 1
+            except Exception as row_error:
+                print(f"单条写入失败 id={params[0]}: {row_error}")
+                conn.rollback()
+
 for _, row in df.iterrows():
     row_id = row['id']
     try:
@@ -218,7 +506,8 @@ for _, row in df.iterrows():
         content = row['content']
         voice_id = row['voice_id']
         voice_length = row['voice_length']
-        print('正在处理:', url)
+        if LOG_RECORDS:
+            print('正在处理:', url)
 
         mp3_dir = 'MP3'
         os.makedirs(mp3_dir, exist_ok=True)
@@ -229,44 +518,34 @@ for _, row in df.iterrows():
         text1, text2, text = result_texts(stereo_audio, row_id)
         transcribe_end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        insert_sql = """
-        INSERT INTO bi.call_to_text
-        (id, voice_id, from_id, receive_id, msg_type, msg_time, voice_length,
-         content, voice_url, left_channel_text, right_channel_text,
-         all_channel_text, transcribe_start_time, transcribe_end_time, model)
-        VALUES
-        (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (id) DO UPDATE SET
-            voice_id = EXCLUDED.voice_id,
-            from_id = EXCLUDED.from_id,
-            receive_id = EXCLUDED.receive_id,
-            msg_type = EXCLUDED.msg_type,
-            msg_time = EXCLUDED.msg_time,
-            voice_length = EXCLUDED.voice_length,
-            content = EXCLUDED.content,
-            voice_url = EXCLUDED.voice_url,
-            left_channel_text = EXCLUDED.left_channel_text,
-            right_channel_text = EXCLUDED.right_channel_text,
-            all_channel_text = EXCLUDED.all_channel_text,
-            transcribe_start_time = EXCLUDED.transcribe_start_time,
-            transcribe_end_time = EXCLUDED.transcribe_end_time,
-            model = EXCLUDED.model
-    """
-
         params = (
             row_id, voice_id, from_id, receive_id, msg_type, msg_time,
             voice_length, content, url, text1, text2, text,
             transcribe_start_time, transcribe_end_time, model_name
         )
 
-        cursor.execute(insert_sql, params)
-        conn.commit()
-        if cursor.rowcount:
-            processed += 1
+        pending_rows.append(params)
+        if len(pending_rows) >= INSERT_BATCH_SIZE:
+            flush_pending_rows()
+        if not KEEP_AUDIO:
+            for path in (
+                audio_path,
+                os.path.join(mp3_dir, f'{row_id}_left.wav'),
+                os.path.join(mp3_dir, f'{row_id}_right.wav'),
+            ):
+                try:
+                    if os.path.exists(path):
+                        os.unlink(path)
+                except OSError:
+                    pass
+        if PROGRESS_EVERY and (processed + len(pending_rows)) % PROGRESS_EVERY == 0:
+            print(f"进度: 已处理 {processed + len(pending_rows)}/{len(df)}")
     except Exception as e:
+        failed += 1
         print(f"处理失败 id={row_id}: {e}")
         conn.rollback()
 
+flush_pending_rows()
 cursor.close()
 conn.close()
-print('处理条数：', processed)
+print('处理条数：', processed, '失败条数：', failed)
