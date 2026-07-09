@@ -334,22 +334,39 @@ def transcribe_by_whisper_segments(audio_path, segment_transcriber):
 
     return {"segments": segments}
 
+def is_audio_usable(audio):
+    return audio is not None and len(audio) >= 300 and audio.rms > 0
+
+def safe_transcribe(audio_path):
+    try:
+        return transcribe(audio_path)
+    except Exception as e:
+        print(f"声道转写失败 {audio_path}: {e}", flush=True)
+        return {"segments": []}
+
 def result_texts(audios, record_id):
     host_path = 'MP3/'
+    mono_channels = audios.split_to_mono()
 
     file_name = f'{record_id}_left.wav'
     file_path = os.path.join(host_path, file_name)
-    left_channel = audios.split_to_mono()[0]
-    left_channel.export(file_path, format="wav")
-    result1 = transcribe(file_path)
+    left_channel = mono_channels[0] if mono_channels else audios
+    if is_audio_usable(left_channel):
+        left_channel.export(file_path, format="wav")
+        result1 = safe_transcribe(file_path)
+    else:
+        result1 = {"segments": []}
     texts1 = format_segments(result1)    
 
-    if audios.channels > 1:
+    if len(mono_channels) > 1:
         file_name = f'{record_id}_right.wav'
         file_path = os.path.join(host_path, file_name)
-        right_channel = audios.split_to_mono()[1]
-        right_channel.export(file_path, format="wav")
-        result2 = transcribe(file_path)
+        right_channel = mono_channels[1]
+        if is_audio_usable(right_channel):
+            right_channel.export(file_path, format="wav")
+            result2 = safe_transcribe(file_path)
+        else:
+            result2 = {"segments": []}
         texts2 = format_segments(result2)
 
         merged_segments_list = merge_segments(result1["segments"], result2["segments"])  
