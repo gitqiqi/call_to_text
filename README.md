@@ -43,6 +43,9 @@ KEEP_AUDIO=0
 # 单次最多处理多少条，0 表示不限
 RUN_LIMIT=0
 
+# 每次扫描最近几个完整自然日的未处理数据，避免某天任务没跑完导致漏补
+LOOKBACK_DAYS=3
+
 # 运行日志。默认不输出每条记录/进度；需要观察时再打开
 LOG_RECORDS=0
 LOG_STAGES=1

@@ -50,6 +50,7 @@ def env_bool(name, default=False):
     return value.strip().lower() in ('1', 'true', 'yes', 'y', 'on')
 
 RUN_LIMIT = env_int('RUN_LIMIT', 0)
+LOOKBACK_DAYS = max(env_int('LOOKBACK_DAYS', 3), 1)
 INSERT_BATCH_SIZE = max(env_int('INSERT_BATCH_SIZE', 100), 1)
 DOWNLOAD_CHUNK_SIZE = max(env_int('DOWNLOAD_CHUNK_SIZE', 1024 * 1024), 1024)
 DOWNLOAD_RETRIES = max(env_int('DOWNLOAD_RETRIES', 3), 1)
@@ -89,7 +90,9 @@ except psycopg2.OperationalError as e:
     raise SystemExit(f"数据库连接失败: {e}")
 
 cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-day=(datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+today = datetime.now().date()
+start_day = (today - timedelta(days=LOOKBACK_DAYS)).strftime('%Y-%m-%d')
+end_day = today.strftime('%Y-%m-%d')
 
 sql="""
 SELECT 
@@ -120,7 +123,8 @@ content::jsonb -> 'meetingVoiceCall' ->> 'ossUrl' AS meet_url,
 
 from book.we_chat_data w
 WHERE  msg_type in ('meeting_voice_call','voice')
-and date(msg_time)=%s
+and msg_time >= %s::date
+and msg_time < %s::date
 and (%s = 1 or mod(abs(hashtext(id::text)), %s) = %s)
 and not exists (
     select 1
@@ -130,11 +134,11 @@ and not exists (
 )t
 order by msg_time
 """
-params = [day, SHARD_COUNT, SHARD_COUNT, SHARD_INDEX]
+params = [start_day, end_day, SHARD_COUNT, SHARD_COUNT, SHARD_INDEX]
 if RUN_LIMIT > 0:
     sql += " limit %s"
     params.append(RUN_LIMIT)
-log_stage('查询待处理音频')
+log_stage(f'查询待处理音频: {start_day} <= msg_time < {end_day}')
 df = pd.read_sql_query(sql, conn, params=tuple(params))
 log_stage(f'待处理音频数量: {len(df)}')
 
