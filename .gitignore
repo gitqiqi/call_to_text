@@ -13,3 +13,4 @@ tools/*.tar*
 .idea/
 .DS_Store
 models/
+run_daily.local.sh

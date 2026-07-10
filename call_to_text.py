@@ -33,6 +33,7 @@ from requests.adapters import HTTPAdapter
 import tempfile
 import re
 import time
+import math
 
 warnings.filterwarnings('ignore')
 
@@ -157,6 +158,24 @@ def downloaded_file(url,host):
             if attempt < DOWNLOAD_RETRIES:
                 time.sleep(min(2 ** attempt, 10))
     raise last_error
+
+
+def normalize_int(value):
+    if value is None:
+        return None
+    if pd.isna(value):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value or value == '-':
+            return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return int(number)
 
 
 def merge_segments(left_segs, right_segs):
@@ -346,7 +365,11 @@ def safe_transcribe(audio_path):
 
 def result_texts(audios, record_id):
     host_path = 'MP3/'
-    mono_channels = audios.split_to_mono()
+    try:
+        mono_channels = audios.split_to_mono()
+    except Exception as e:
+        print(f"音频拆分声道失败 id={record_id}: {e}", flush=True)
+        mono_channels = []
 
     file_name = f'{record_id}_left.wav'
     file_path = os.path.join(host_path, file_name)
@@ -520,7 +543,7 @@ ON CONFLICT (id) DO UPDATE SET
 """
 
 def flush_pending_rows():
-    global processed, pending_rows
+    global processed, failed, pending_rows
     if not pending_rows:
         return
     rows = pending_rows
@@ -538,6 +561,7 @@ def flush_pending_rows():
                 conn.commit()
                 processed += 1
             except Exception as row_error:
+                failed += 1
                 print(f"单条写入失败 id={params[0]}: {row_error}")
                 conn.rollback()
 
@@ -551,7 +575,7 @@ for _, row in df.iterrows():
         receive_id = row['receive_id']
         content = row['content']
         voice_id = row['voice_id']
-        voice_length = row['voice_length']
+        voice_length = normalize_int(row['voice_length'])
         if LOG_RECORDS:
             print('正在处理:', url)
 
