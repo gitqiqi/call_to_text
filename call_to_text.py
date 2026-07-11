@@ -104,7 +104,7 @@ receive_id,
 content,
 coalesce(voice_id,sdk_file_id) as voice_id,
 coalesce(voice_url,meet_url) as voice_url,
-coalesce(voice_length, cast(EXTRACT(EPOCH FROM (TO_TIMESTAMP(end_time) - msg_time::timestamp)) as char)) as voice_length
+coalesce(voice_length, EXTRACT(EPOCH FROM (TO_TIMESTAMP(end_time) - msg_time::timestamp))::text) as voice_length
 from (
 select 
 id,
