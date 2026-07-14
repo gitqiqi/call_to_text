@@ -235,6 +235,13 @@ def normalize_int(value):
     return int(number)
 
 
+def audio_duration_seconds(audio):
+    duration_ms = len(audio)
+    if duration_ms <= 0:
+        return None
+    return max(int(round(duration_ms / 1000)), 1)
+
+
 def merge_segments(left_segs, right_segs):
     """内部函数：合并排序两个声道的话段"""
     merged = []
@@ -641,6 +648,7 @@ for _, row in df.iterrows():
         audio_path = record_paths[0]
         downloaded_file(url, audio_path)
         stereo_audio = AudioSegment.from_file(audio_path, format="mp3")
+        voice_length = audio_duration_seconds(stereo_audio) or voice_length
         transcribe_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         transcribe_perf_start = time.perf_counter()
         text1, text2, text = result_texts(stereo_audio, row_id, RUN_AUDIO_DIR)
