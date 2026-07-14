@@ -34,6 +34,7 @@ import tempfile
 import re
 import time
 import math
+import shutil
 
 warnings.filterwarnings('ignore')
 
@@ -55,6 +56,7 @@ INSERT_BATCH_SIZE = max(env_int('INSERT_BATCH_SIZE', 100), 1)
 DOWNLOAD_CHUNK_SIZE = max(env_int('DOWNLOAD_CHUNK_SIZE', 1024 * 1024), 1024)
 DOWNLOAD_RETRIES = max(env_int('DOWNLOAD_RETRIES', 3), 1)
 KEEP_AUDIO = env_bool('KEEP_AUDIO', False)
+CLEANUP_AUDIO_HOURS = max(env_int('CLEANUP_AUDIO_HOURS', 24), 0)
 PROGRESS_EVERY = max(env_int('PROGRESS_EVERY', 0), 0)
 LOG_RECORDS = env_bool('LOG_RECORDS', False)
 LOG_STAGES = env_bool('LOG_STAGES', True)
@@ -70,6 +72,57 @@ if SHARD_COUNT > 1 and not 0 <= SHARD_INDEX < SHARD_COUNT:
 def log_stage(message):
     if LOG_STAGES:
         print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {message}", flush=True)
+
+
+AUDIO_ROOT = os.getenv('AUDIO_DIR', 'MP3')
+RUN_AUDIO_DIR = os.path.join(AUDIO_ROOT, f'run_{os.getpid()}')
+
+
+def record_audio_paths(record_id, host_path):
+    return [
+        os.path.join(host_path, f'{record_id}.mp3'),
+        os.path.join(host_path, f'{record_id}_left.wav'),
+        os.path.join(host_path, f'{record_id}_right.wav'),
+    ]
+
+
+def cleanup_paths(paths):
+    for path in paths:
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except OSError:
+            pass
+
+
+def cleanup_stale_audio(root_dir, max_age_hours):
+    if max_age_hours <= 0 or not os.path.isdir(root_dir):
+        return
+    cutoff = time.time() - max_age_hours * 3600
+    removed = 0
+    for current_dir, _, files in os.walk(root_dir, topdown=False):
+        for file_name in files:
+            if not file_name.lower().endswith(('.mp3', '.wav')):
+                continue
+            path = os.path.join(current_dir, file_name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.unlink(path)
+                    removed += 1
+            except OSError:
+                pass
+        if current_dir != root_dir:
+            try:
+                os.rmdir(current_dir)
+            except OSError:
+                pass
+    if removed:
+        log_stage(f'清理历史临时音频: {removed} 个文件')
+
+
+if not KEEP_AUDIO:
+    cleanup_stale_audio(AUDIO_ROOT, CLEANUP_AUDIO_HOURS)
+os.makedirs(RUN_AUDIO_DIR, exist_ok=True)
 
 db_host = os.getenv('DB_HOLOGRES_HOST')
 db_name = os.getenv('DB_HOLOGRES_DATABASE', 'db')
@@ -367,8 +420,8 @@ def safe_transcribe(audio_path):
         print(f"声道转写失败 {audio_path}: {e}", flush=True)
         return {"segments": []}
 
-def result_texts(audios, record_id):
-    host_path = 'MP3/'
+def result_texts(audios, record_id, host_path):
+    os.makedirs(host_path, exist_ok=True)
     try:
         mono_channels = audios.split_to_mono()
     except Exception as e:
@@ -571,6 +624,7 @@ def flush_pending_rows():
 
 for _, row in df.iterrows():
     row_id = row['id']
+    record_paths = record_audio_paths(row_id, RUN_AUDIO_DIR)
     try:
         url = row['voice_url']
         msg_type = row['msg_type']
@@ -583,14 +637,13 @@ for _, row in df.iterrows():
         if LOG_RECORDS:
             print('正在处理:', url)
 
-        mp3_dir = 'MP3'
-        os.makedirs(mp3_dir, exist_ok=True)
-        audio_path = os.path.join(mp3_dir, f'{row_id}.mp3')
+        os.makedirs(RUN_AUDIO_DIR, exist_ok=True)
+        audio_path = record_paths[0]
         downloaded_file(url, audio_path)
         stereo_audio = AudioSegment.from_file(audio_path, format="mp3")
         transcribe_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         transcribe_perf_start = time.perf_counter()
-        text1, text2, text = result_texts(stereo_audio, row_id)
+        text1, text2, text = result_texts(stereo_audio, row_id, RUN_AUDIO_DIR)
         transcribe_duration_ms = int((time.perf_counter() - transcribe_perf_start) * 1000)
         transcribe_end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -603,25 +656,19 @@ for _, row in df.iterrows():
         pending_rows.append(params)
         if len(pending_rows) >= INSERT_BATCH_SIZE:
             flush_pending_rows()
-        if not KEEP_AUDIO:
-            for path in (
-                audio_path,
-                os.path.join(mp3_dir, f'{row_id}_left.wav'),
-                os.path.join(mp3_dir, f'{row_id}_right.wav'),
-            ):
-                try:
-                    if os.path.exists(path):
-                        os.unlink(path)
-                except OSError:
-                    pass
         if PROGRESS_EVERY and (processed + len(pending_rows)) % PROGRESS_EVERY == 0:
             print(f"进度: 已处理 {processed + len(pending_rows)}/{len(df)}")
     except Exception as e:
         failed += 1
         print(f"处理失败 id={row_id}: {e}")
         conn.rollback()
+    finally:
+        if not KEEP_AUDIO:
+            cleanup_paths(record_paths)
 
 flush_pending_rows()
 cursor.close()
 conn.close()
+if not KEEP_AUDIO:
+    shutil.rmtree(RUN_AUDIO_DIR, ignore_errors=True)
 print('处理条数：', processed, '失败条数：', failed)

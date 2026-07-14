@@ -40,6 +40,9 @@ INSERT_BATCH_SIZE=100
 # 处理完成后删除下载的 mp3/wav，避免 MP3 目录越积越大
 KEEP_AUDIO=0
 
+# 启动时清理超过多少小时的历史临时音频，0 表示不做启动清理
+CLEANUP_AUDIO_HOURS=24
+
 # 单次最多处理多少条，0 表示不限
 RUN_LIMIT=0
 
