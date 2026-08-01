@@ -52,6 +52,9 @@ def env_bool(name, default=False):
 
 RUN_LIMIT = env_int('RUN_LIMIT', 0)
 LOOKBACK_DAYS = max(env_int('LOOKBACK_DAYS', 3), 1)
+START_DATE = os.getenv('START_DATE', '').strip()
+END_DATE = os.getenv('END_DATE', '').strip()
+COUNT_PENDING_ONLY = env_bool('COUNT_PENDING_ONLY', False)
 INSERT_BATCH_SIZE = max(env_int('INSERT_BATCH_SIZE', 100), 1)
 DOWNLOAD_CHUNK_SIZE = max(env_int('DOWNLOAD_CHUNK_SIZE', 1024 * 1024), 1024)
 DOWNLOAD_RETRIES = max(env_int('DOWNLOAD_RETRIES', 3), 1)
@@ -72,6 +75,28 @@ if SHARD_COUNT > 1 and not 0 <= SHARD_INDEX < SHARD_COUNT:
 def log_stage(message):
     if LOG_STAGES:
         print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {message}", flush=True)
+
+
+def parse_date(name, value):
+    try:
+        return datetime.strptime(value, '%Y-%m-%d').date()
+    except ValueError:
+        raise SystemExit(f"{name} 必须使用 YYYY-MM-DD 格式")
+
+
+def resolve_date_range():
+    if START_DATE or END_DATE:
+        if not START_DATE or not END_DATE:
+            raise SystemExit("START_DATE 和 END_DATE 必须同时设置")
+        start = parse_date('START_DATE', START_DATE)
+        end = parse_date('END_DATE', END_DATE)
+        if start >= end:
+            raise SystemExit("START_DATE 必须早于 END_DATE")
+        return start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d')
+
+    today = datetime.now().date()
+    start = today - timedelta(days=LOOKBACK_DAYS)
+    return start.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d')
 
 
 AUDIO_ROOT = os.getenv('AUDIO_DIR', 'MP3')
@@ -143,12 +168,39 @@ except psycopg2.OperationalError as e:
     raise SystemExit(f"数据库连接失败: {e}")
 
 cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-today = datetime.now().date()
-start_day = (today - timedelta(days=LOOKBACK_DAYS)).strftime('%Y-%m-%d')
-end_day = today.strftime('%Y-%m-%d')
+start_day, end_day = resolve_date_range()
 
-sql="""
-SELECT 
+pending_audio_from_sql = """
+from (
+    select
+    id,
+    msg_type,
+    msg_time,
+    from_id,
+    receive_id,
+    content,
+    content::jsonb -> 'voice' ->> 'sdkFileId' AS voice_id,
+    content::jsonb -> 'voice' ->> 'ossUrl' as voice_url,
+    content::jsonb -> 'voice' ->> 'playLength' as voice_length,
+
+    content::jsonb -> 'meetingVoiceCall' ->> 'sdkFileId' AS sdk_file_id,
+    content::jsonb -> 'meetingVoiceCall' ->> 'ossUrl' AS meet_url,
+    (content::jsonb -> 'meetingVoiceCall' ->> 'endTime')::bigint as end_time
+
+    from book.we_chat_data w
+    WHERE  msg_type in ('meeting_voice_call','voice')
+    and msg_time >= %s::date
+    and msg_time < %s::date
+    and (%s = 1 or mod(abs(hashtext(id::text)), %s) = %s)
+    and not exists (
+        select 1
+        from bi.call_to_text ctt
+        where ctt.id = w.id
+    )
+)t
+"""
+sql=f"""
+SELECT
 id,
 msg_type,
 msg_time,
@@ -158,42 +210,34 @@ content,
 coalesce(voice_id,sdk_file_id) as voice_id,
 coalesce(voice_url,meet_url) as voice_url,
 coalesce(voice_length, EXTRACT(EPOCH FROM (TO_TIMESTAMP(end_time) - msg_time::timestamp))::text) as voice_length
-from (
-select 
-id,
-msg_type,
-msg_time,
-from_id,
-receive_id,
-content,
-content::jsonb -> 'voice' ->> 'sdkFileId' AS voice_id,
-content::jsonb -> 'voice' ->> 'ossUrl' as voice_url,
-content::jsonb -> 'voice' ->> 'playLength' as voice_length,
-
-content::jsonb -> 'meetingVoiceCall' ->> 'sdkFileId' AS sdk_file_id,
-content::jsonb -> 'meetingVoiceCall' ->> 'ossUrl' AS meet_url,
-(content::jsonb -> 'meetingVoiceCall' ->> 'endTime')::bigint as end_time
-
-from book.we_chat_data w
-WHERE  msg_type in ('meeting_voice_call','voice')
-and msg_time >= %s::date
-and msg_time < %s::date
-and (%s = 1 or mod(abs(hashtext(id::text)), %s) = %s)
-and not exists (
-    select 1
-    from bi.call_to_text ctt
-    where ctt.id = w.id
-)
-)t
+{pending_audio_from_sql}
 order by msg_time
 """
 params = [start_day, end_day, SHARD_COUNT, SHARD_COUNT, SHARD_INDEX]
+if COUNT_PENDING_ONLY:
+    count_sql = f"select count(*) as pending_count {pending_audio_from_sql}"
+    cursor.execute(count_sql, tuple(params))
+    pending_count = cursor.fetchone()['pending_count']
+    print(f"PENDING_COUNT={pending_count}", flush=True)
+    cursor.close()
+    conn.close()
+    if not KEEP_AUDIO:
+        shutil.rmtree(RUN_AUDIO_DIR, ignore_errors=True)
+    raise SystemExit(0)
+
 if RUN_LIMIT > 0:
     sql += " limit %s"
     params.append(RUN_LIMIT)
 log_stage(f'查询待处理音频: {start_day} <= msg_time < {end_day}')
 df = pd.read_sql_query(sql, conn, params=tuple(params))
 log_stage(f'待处理音频数量: {len(df)}')
+if len(df) == 0:
+    cursor.close()
+    conn.close()
+    if not KEEP_AUDIO:
+        shutil.rmtree(RUN_AUDIO_DIR, ignore_errors=True)
+    print('处理条数：', 0, '失败条数：', 0)
+    raise SystemExit(0)
 
 http_session = requests.Session()
 http_session.mount('http://', HTTPAdapter(pool_connections=16, pool_maxsize=16))

@@ -1,39 +1,60 @@
-#!/bin/bash
-# run_history_daemon.sh - 守护进程：主任务完成后自动恢复历史任务
+#!/usr/bin/env bash
+set -euo pipefail
 
-cd /home/wenba/laiqiqi/call_to_text
-HISTORY_LOG="logs/history_daemon.log"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+mkdir -p logs
 
-echo "$(date '+%F %T') 守护进程启动" >> $HISTORY_LOG
+if [ -f .env ]; then
+  set -a
+  . ./.env
+  set +a
+fi
 
-# 检查是否已有守护进程在运行
-if pgrep -f "run_history_daemon.sh" | grep -v $$ > /dev/null; then
-    echo "$(date '+%F %T') 已有守护进程在运行，退出" >> $HISTORY_LOG
+HISTORY_LOG=${HISTORY_LOG:-logs/history_daemon.log}
+DAEMON_LOCK=${HISTORY_DAEMON_LOCK:-/tmp/call_to_text_history_daemon.lock}
+HISTORY_LOCK=${HISTORY_LOCK:-/tmp/call_to_text_history.lock}
+MAIN_LOCK=${MAIN_LOCK:-/tmp/call_to_text.lock}
+DONE_FILE=${HISTORY_DONE_FILE:-/tmp/call_to_text_history.done}
+CHECK_INTERVAL=${HISTORY_DAEMON_INTERVAL:-300}
+
+log() {
+    echo "$(date '+%F %T') $*" >> "$HISTORY_LOG"
+}
+
+history_is_running() {
+    ! /usr/bin/flock -n "$HISTORY_LOCK" -c true 2>/dev/null
+}
+
+main_is_idle() {
+    /usr/bin/flock -n "$MAIN_LOCK" -c true 2>/dev/null
+}
+
+exec 8>"$DAEMON_LOCK"
+if ! /usr/bin/flock -n 8; then
+    log "已有守护进程在运行，退出"
     exit 0
 fi
 
+log "守护进程启动"
+
 while true; do
-    # 检查历史任务是否在运行
-    if ! pgrep -f "run_history_smart.sh" > /dev/null; then
-        # 检查是否有剩余数据需要处理
-        if [ -f "/tmp/history_progress.txt" ]; then
-            REMAIN=$(cat /tmp/history_progress.txt 2>/dev/null || echo "0")
-            if [ "$REMAIN" -gt "0" ]; then
-                # 检查锁是否空闲
-                if flock -n /tmp/call_to_text.lock -c "echo 锁已获取" 2>/dev/null; then
-                    echo "$(date '+%F %T') 主任务已完成，恢复历史任务 (剩余 $REMAIN 天)" >> $HISTORY_LOG
-                    nohup ./run_history_smart.sh >> logs/history_smart.log 2>&1 &
-                else
-                    echo "$(date '+%F %T') 主任务正在运行，等待..." >> $HISTORY_LOG
-                fi
-            else
-                # 没有剩余数据，退出守护进程
-                echo "$(date '+%F %T') 所有历史数据已处理完成，守护进程退出" >> $HISTORY_LOG
-                rm -f /tmp/history_progress.txt
-                exit 0
-            fi
-        fi
+    if [ -f "$DONE_FILE" ]; then
+        log "历史任务已完成，守护进程退出"
+        exit 0
     fi
-    
-    sleep 300  # 每5分钟检查一次
+
+    if history_is_running; then
+        sleep "$CHECK_INTERVAL"
+        continue
+    fi
+
+    if main_is_idle; then
+        log "主任务空闲，启动/恢复历史任务"
+        nohup "$SCRIPT_DIR/run_history_smart.sh" >> "$HISTORY_LOG" 2>&1 &
+    else
+        log "主任务正在运行，等待..."
+    fi
+
+    sleep "$CHECK_INTERVAL"
 done

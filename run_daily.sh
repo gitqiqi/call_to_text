@@ -35,5 +35,15 @@ export ASR_OUTPUT_TIMESTAMP=${ASR_OUTPUT_TIMESTAMP:-1}
 export SHARD_COUNT=${SHARD_COUNT:-1}
 export SHARD_INDEX=${SHARD_INDEX:-0}
 
-echo "$(date '+%F %T') START LOOKBACK_DAYS=$LOOKBACK_DAYS ASR_MODEL=$ASR_MODEL ASR_DEVICE=${ASR_DEVICE:-} SHARD_COUNT=$SHARD_COUNT SHARD_INDEX=$SHARD_INDEX" >> "logs/call_to_text_$(date +%F).log"
-"$PYTHON_BIN" call_to_text.py >> "logs/call_to_text_$(date +%F).log" 2>&1
+LOG_FILE="logs/call_to_text_$(date +%F).log"
+DATE_WINDOW="LOOKBACK_DAYS=$LOOKBACK_DAYS"
+if [ -n "${START_DATE:-}" ] || [ -n "${END_DATE:-}" ]; then
+  DATE_WINDOW="START_DATE=${START_DATE:-} END_DATE=${END_DATE:-}"
+fi
+
+echo "$(date '+%F %T') START $DATE_WINDOW ASR_MODEL=$ASR_MODEL ASR_DEVICE=${ASR_DEVICE:-} SHARD_COUNT=$SHARD_COUNT SHARD_INDEX=$SHARD_INDEX" >> "$LOG_FILE"
+if [ "${COUNT_PENDING_ONLY:-0}" = "1" ]; then
+  "$PYTHON_BIN" call_to_text.py 2>&1 | tee -a "$LOG_FILE"
+else
+  "$PYTHON_BIN" call_to_text.py >> "$LOG_FILE" 2>&1
+fi

@@ -1,80 +1,229 @@
-#!/bin/bash
-# run_history_smart.sh - 智能历史任务（自动让路给主任务）
+#!/usr/bin/env bash
+set -u -o pipefail
 
-cd /home/wenba/laiqiqi/call_to_text
-source venv/bin/activate
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+mkdir -p logs
 
-BATCH_DAYS=${1:-10}              # 每批10天
-TOTAL_DAYS=${2:-1000}            # 总共1000天
-STATE_FILE="/tmp/history_progress.txt"  # 记录进度
-HISTORY_LOG="logs/history_smart.log"
+if [ -f .env ]; then
+  set -a
+  . ./.env
+  set +a
+fi
 
-# 检查是否已有运行中的实例
-if [ -f "$STATE_FILE" ]; then
-    echo "$(date '+%F %T') 检测到已有历史任务运行中，退出" >> $HISTORY_LOG
+BATCH_DAYS=${1:-${HISTORY_BATCH_DAYS:-10}}
+TOTAL_DAYS=${2:-${HISTORY_TOTAL_DAYS:-1000}}
+MAIN_LOOKBACK_DAYS=${HISTORY_SKIP_RECENT_DAYS:-3}
+STATE_FILE=${HISTORY_STATE_FILE:-/tmp/history_progress.txt}
+DONE_FILE=${HISTORY_DONE_FILE:-/tmp/call_to_text_history.done}
+HISTORY_LOCK=${HISTORY_LOCK:-/tmp/call_to_text_history.lock}
+MAIN_LOCK=${MAIN_LOCK:-/tmp/call_to_text.lock}
+HISTORY_LOG=${HISTORY_LOG:-logs/history_smart.log}
+ASR_MODEL=${ASR_MODEL:-sensevoice}
+ASR_DEVICE=${ASR_DEVICE:-cuda:0}
+HISTORY_STOP_TIME=${HISTORY_STOP_TIME:-23:00}
+MIN_BATCH_SECONDS=${HISTORY_MIN_BATCH_SECONDS:-600}
+RETRY_SLEEP_SECONDS=${HISTORY_RETRY_SLEEP_SECONDS:-1800}
+
+log() {
+    echo "$(date '+%F %T') $*" >> "$HISTORY_LOG"
+}
+
+date_add_days() {
+    date -d "$1 + $2 days" +%F
+}
+
+date_to_epoch() {
+    date -d "$1" +%s
+}
+
+min_date() {
+    if [ "$(date_to_epoch "$1")" -le "$(date_to_epoch "$2")" ]; then
+        echo "$1"
+    else
+        echo "$2"
+    fi
+}
+
+valid_date() {
+    date -d "$1" +%F >/dev/null 2>&1
+}
+
+is_positive_int() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+seconds_until_stop() {
+    local now target
+    now=$(date +%s)
+    target=$(date -d "$(date +%F) $HISTORY_STOP_TIME:00" +%s)
+    echo $((target - now))
+}
+
+pending_count_for_window() {
+    local window_start=$1
+    local window_end=$2
+    local output status count
+
+    output=$(
+        /usr/bin/env \
+            START_DATE="$window_start" \
+            END_DATE="$window_end" \
+            COUNT_PENDING_ONLY=1 \
+            ASR_MODEL="$ASR_MODEL" \
+            ASR_DEVICE="$ASR_DEVICE" \
+            "$SCRIPT_DIR/run_daily.sh" 2>&1
+    )
+    status=$?
+    printf '%s\n' "$output" >> "$HISTORY_LOG"
+    if [ "$status" -ne 0 ]; then
+        return "$status"
+    fi
+
+    count=$(printf '%s\n' "$output" | awk -F= '/^PENDING_COUNT=/{value=$2} END{print value}')
+    if [ -z "$count" ]; then
+        log "无法解析待处理数量: $window_start <= msg_time < $window_end"
+        return 1
+    fi
+    echo "$count"
+}
+
+run_window() {
+    local window_start=$1
+    local window_end=$2
+    local seconds_left=$3
+    local timeout_cmd=()
+
+    if command -v timeout >/dev/null 2>&1; then
+        timeout_cmd=(timeout "$seconds_left")
+    fi
+
+    "${timeout_cmd[@]}" /usr/bin/flock -w 60 "$MAIN_LOCK" \
+        /usr/bin/env \
+            START_DATE="$window_start" \
+            END_DATE="$window_end" \
+            ASR_MODEL="$ASR_MODEL" \
+            ASR_DEVICE="$ASR_DEVICE" \
+            "$SCRIPT_DIR/run_daily.sh"
+}
+
+exec 9>"$HISTORY_LOCK"
+if ! /usr/bin/flock -n 9; then
+    log "已有历史任务在运行，退出"
     exit 0
 fi
 
-echo "$(date '+%F %T') ========== 智能历史任务启动 ==========" >> $HISTORY_LOG
-
-# 初始化进度
-if [ ! -f "$STATE_FILE" ]; then
-    echo "$TOTAL_DAYS" > "$STATE_FILE"
+if [ -f "$DONE_FILE" ]; then
+    log "历史任务已标记完成，如需重跑请删除 $DONE_FILE"
+    exit 0
 fi
 
+if ! is_positive_int "$BATCH_DAYS"; then
+    log "HISTORY_BATCH_DAYS 必须大于 0"
+    exit 1
+fi
+
+if ! is_positive_int "$TOTAL_DAYS"; then
+    log "HISTORY_TOTAL_DAYS 必须大于 0"
+    exit 1
+fi
+
+if ! is_positive_int "$MAIN_LOOKBACK_DAYS"; then
+    log "HISTORY_SKIP_RECENT_DAYS 必须大于 0"
+    exit 1
+fi
+
+if ! is_positive_int "$MIN_BATCH_SECONDS"; then
+    log "HISTORY_MIN_BATCH_SECONDS 必须大于 0"
+    exit 1
+fi
+
+if ! is_positive_int "$RETRY_SLEEP_SECONDS"; then
+    log "HISTORY_RETRY_SLEEP_SECONDS 必须大于 0"
+    exit 1
+fi
+
+if ! date -d "$(date +%F) $HISTORY_STOP_TIME:00" +%s >/dev/null 2>&1; then
+    log "HISTORY_STOP_TIME 必须使用 HH:MM 格式"
+    exit 1
+fi
+
+HISTORY_END_DATE=${HISTORY_END_DATE:-$(date -d "$(date +%F) - $MAIN_LOOKBACK_DAYS days" +%F)}
+HISTORY_START_DATE=${HISTORY_START_DATE:-$(date -d "$HISTORY_END_DATE - $TOTAL_DAYS days" +%F)}
+
+if ! valid_date "$HISTORY_START_DATE" || ! valid_date "$HISTORY_END_DATE"; then
+    log "HISTORY_START_DATE/HISTORY_END_DATE 必须使用 YYYY-MM-DD 格式"
+    exit 1
+fi
+
+if [ "$(date_to_epoch "$HISTORY_START_DATE")" -ge "$(date_to_epoch "$HISTORY_END_DATE")" ]; then
+    log "HISTORY_START_DATE 必须早于 HISTORY_END_DATE"
+    exit 1
+fi
+
+if [ -f "$STATE_FILE" ]; then
+    CURRENT_START=$(cat "$STATE_FILE" 2>/dev/null || true)
+    if ! valid_date "$CURRENT_START"; then
+        log "进度文件内容无效，重新从 $HISTORY_START_DATE 开始: $STATE_FILE"
+        CURRENT_START=$HISTORY_START_DATE
+        echo "$CURRENT_START" > "$STATE_FILE"
+    fi
+else
+    CURRENT_START=$HISTORY_START_DATE
+    echo "$CURRENT_START" > "$STATE_FILE"
+fi
+
+log "========== 历史任务启动: $CURRENT_START -> $HISTORY_END_DATE, batch=${BATCH_DAYS}d =========="
+
 while true; do
-    # 读取当前剩余天数
-    CURRENT_DAYS=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
-    
-    if [ "$CURRENT_DAYS" -le 0 ]; then
-        echo "$(date '+%F %T') ✅ 所有历史数据处理完成！" >> $HISTORY_LOG
+    CURRENT_START=$(cat "$STATE_FILE" 2>/dev/null || echo "$HISTORY_START_DATE")
+
+    if [ "$(date_to_epoch "$CURRENT_START")" -ge "$(date_to_epoch "$HISTORY_END_DATE")" ]; then
+        log "所有历史数据处理完成: $HISTORY_START_DATE <= msg_time < $HISTORY_END_DATE"
         rm -f "$STATE_FILE"
+        echo "$(date '+%F %T')" > "$DONE_FILE"
         break
     fi
-    
-    # 计算本次批次
-    BATCH=$((CURRENT_DAYS > BATCH_DAYS ? BATCH_DAYS : CURRENT_DAYS))
-    
-    echo "$(date '+%F %T') 📦 开始处理批次: $BATCH 天 (剩余 $CURRENT_DAYS 天)" >> $HISTORY_LOG
-    
-    # 尝试获取锁，只等60秒
-    /usr/bin/flock -w 60 /tmp/call_to_text.lock \
-        /usr/bin/env LOOKBACK_DAYS=$BATCH \
-        ASR_MODEL=sensevoice \
-        ASR_DEVICE=cuda:0 \
-        /home/wenba/laiqiqi/call_to_text/run_daily.sh
-    
-    # 检查执行结果
-    if [ $? -eq 0 ]; then
-        # 成功完成一批，更新进度
-        NEW_DAYS=$((CURRENT_DAYS - BATCH))
-        echo "$NEW_DAYS" > "$STATE_FILE"
-        echo "$(date '+%F %T') ✅ 批次完成，剩余 $NEW_DAYS 天" >> $HISTORY_LOG
-    else
-        # 如果获取锁失败（主任务正在运行），等待并继续
-        echo "$(date '+%F %T') ⏳ 主任务正在运行，等待30分钟后重试..." >> $HISTORY_LOG
-        sleep 1800  # 等待30分钟
+
+    SECONDS_LEFT=$(seconds_until_stop)
+    if [ "$SECONDS_LEFT" -lt "$MIN_BATCH_SECONDS" ]; then
+        log "距离让路时间 $HISTORY_STOP_TIME 不足 $((MIN_BATCH_SECONDS / 60)) 分钟，退出等待下次恢复"
+        exit 0
+    fi
+
+    BATCH_END=$(min_date "$(date_add_days "$CURRENT_START" "$BATCH_DAYS")" "$HISTORY_END_DATE")
+    log "开始处理窗口: $CURRENT_START <= msg_time < $BATCH_END, 最多运行 $((SECONDS_LEFT / 60)) 分钟"
+
+    run_window "$CURRENT_START" "$BATCH_END" "$SECONDS_LEFT"
+    RUN_STATUS=$?
+
+    if [ "$RUN_STATUS" -eq 124 ]; then
+        log "窗口处理达到时间上限，保留进度 $CURRENT_START，等待下次继续"
+        exit 0
+    fi
+
+    if [ "$RUN_STATUS" -ne 0 ]; then
+        log "窗口处理失败 status=$RUN_STATUS，保留进度 $CURRENT_START，$((RETRY_SLEEP_SECONDS / 60)) 分钟后重试"
+        sleep "$RETRY_SLEEP_SECONDS"
         continue
     fi
-    
-    # 每批完成后休息一下，让系统喘口气
-    sleep 10
-    
-    # 检查现在几点了，如果在主任务执行前1小时内，主动等待
-    CURRENT_HOUR=$(date +%H)
-    CURRENT_MIN=$(date +%M)
-    if [ "$CURRENT_HOUR" = "23" ] || [ "$CURRENT_HOUR" = "00" ]; then
-        # 接近凌晨0点，主动等待到00:30
-        echo "$(date '+%F %T') 🌙 接近主任务执行时间，等待到00:30..." >> $HISTORY_LOG
-        # 计算到00:30的秒数
-        NOW_SEC=$(date +%s)
-        TARGET=$(date -d "00:30:00" +%s 2>/dev/null || echo $(($(date +%s) + 1800)))
-        if [ $NOW_SEC -lt $TARGET ]; then
-            SLEEP_SEC=$((TARGET - NOW_SEC + 10))
-            echo "$(date '+%F %T') 等待 $((SLEEP_SEC / 60)) 分钟" >> $HISTORY_LOG
-            sleep $SLEEP_SEC
-        fi
+
+    PENDING_COUNT=$(pending_count_for_window "$CURRENT_START" "$BATCH_END")
+    COUNT_STATUS=$?
+    if [ "$COUNT_STATUS" -ne 0 ]; then
+        log "待处理数量检查失败，保留进度 $CURRENT_START，$((RETRY_SLEEP_SECONDS / 60)) 分钟后重试"
+        sleep "$RETRY_SLEEP_SECONDS"
+        continue
     fi
+
+    if [ "$PENDING_COUNT" -eq 0 ]; then
+        echo "$BATCH_END" > "$STATE_FILE"
+        log "窗口完成，进度推进到 $BATCH_END"
+    else
+        log "窗口仍有 $PENDING_COUNT 条待处理，继续重跑当前窗口"
+    fi
+
+    sleep 10
 done
 
-echo "$(date '+%F %T') ========== 智能历史任务完成 ==========" >> $HISTORY_LOG
+log "========== 历史任务结束 =========="

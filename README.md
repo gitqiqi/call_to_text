@@ -49,6 +49,10 @@ RUN_LIMIT=0
 # 每次扫描最近几个完整自然日的未处理数据，避免某天任务没跑完导致漏补
 LOOKBACK_DAYS=3
 
+# 固定日期窗口，历史补跑用；设置后优先于 LOOKBACK_DAYS
+# START_DATE=2025-01-01
+# END_DATE=2025-01-11
+
 # 运行日志。默认不输出每条记录/进度；需要观察时再打开
 LOG_RECORDS=0
 LOG_STAGES=1
@@ -69,12 +73,6 @@ ASR_HOTWORDS="退费 退款 退课 暑假集训 奥数 数学思维 小课 答�
 ## 运行
 
 ```bash
-./run.sh
-```
-
-定时/批处理脚本：
-
-```bash
 ./run_daily.sh
 ```
 
@@ -93,6 +91,27 @@ wait
 ```
 
 如果是 CPU 跑，先从 2 个分片开始；如果是 GPU 跑，通常单进程或少量分片更稳，避免显存被多进程抢满。
+
+## 历史补跑
+
+历史任务使用固定日期窗口补跑，不再用 `LOOKBACK_DAYS` 反复扫描最近 N 天。默认每批 10 天，范围为最近 1000 天里排除日常任务覆盖的最近 3 天：
+
+```bash
+./run_history_smart.sh
+```
+
+常用覆盖项：
+
+```bash
+HISTORY_START_DATE=2024-01-01 HISTORY_END_DATE=2024-06-01 ./run_history_smart.sh
+HISTORY_BATCH_DAYS=5 HISTORY_STOP_TIME=23:00 ./run_history_smart.sh
+```
+
+这些 `HISTORY_*` 配置也可以写在 `.env` 里，让 `run_history_smart.sh` 和 `run_history_daemon.sh` 自动读取。
+
+每个窗口跑完后会再次检查是否还有未写入 `bi.call_to_text` 的记录；只有窗口清空才推进进度。若到达 `HISTORY_STOP_TIME` 或被中断，下次会继续当前窗口，已写入的数据会被自动跳过。
+
+进度默认记录在 `/tmp/history_progress.txt`；全部完成后会写入 `/tmp/call_to_text_history.done`。如果需要重跑历史任务，先删除这两个文件。
 
 ## 数据库字段
 
