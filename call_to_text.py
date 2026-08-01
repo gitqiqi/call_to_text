@@ -66,6 +66,8 @@ LOG_STAGES = env_bool('LOG_STAGES', True)
 ASR_OUTPUT_TIMESTAMP = env_bool('ASR_OUTPUT_TIMESTAMP', True)
 ASR_MAX_SEGMENT_CHARS = max(env_int('ASR_MAX_SEGMENT_CHARS', 80), 10)
 ASR_MAX_SEGMENT_SECONDS = max(env_int('ASR_MAX_SEGMENT_SECONDS', 20), 5)
+ASR_CHUNK_SECONDS = max(env_int('ASR_CHUNK_SECONDS', 180), 0)
+ASR_OOM_CHUNK_SECONDS = max(env_int('ASR_OOM_CHUNK_SECONDS', 60), 10)
 PARAFORMER_PUNC = env_bool('PARAFORMER_PUNC', True)
 SHARD_COUNT = max(env_int('SHARD_COUNT', 1), 1)
 SHARD_INDEX = env_int('SHARD_INDEX', 0)
@@ -420,6 +422,91 @@ def generate_with_timestamp_fallback(model, generate_kwargs):
         fallback_kwargs.pop('sentence_timestamp', None)
         return model.generate(**fallback_kwargs)
 
+
+def is_cuda_oom_error(error):
+    message = str(error).lower()
+    return 'cuda out of memory' in message or ('cuda' in message and 'out of memory' in message)
+
+
+def clear_cuda_cache():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def shifted_segments(result, offset_ms):
+    shifted = []
+    offset_seconds = offset_ms / 1000
+    for seg in result.get('segments', []):
+        item = seg.copy()
+        original_start = float(seg.get('start', 0) or 0)
+        original_end = float(seg.get('end', original_start) or original_start)
+        item['start'] = original_start + offset_seconds
+        item['end'] = original_end + offset_seconds
+        shifted.append(item)
+    return shifted
+
+
+def transcribe_by_fixed_chunks(audio_path, chunk_transcriber, chunk_seconds, raise_cuda_oom=True):
+    audio = AudioSegment.from_file(audio_path, format="wav")
+    chunk_ms = max(int(chunk_seconds * 1000), 1000)
+    if len(audio) <= chunk_ms:
+        return chunk_transcriber(audio_path)
+
+    log_stage(f'长音频分块转写: {audio_path}, 时长 {len(audio) // 1000}s, 分块 {chunk_seconds}s')
+    segments = []
+    for start_ms in range(0, len(audio), chunk_ms):
+        end_ms = min(start_ms + chunk_ms, len(audio))
+        chunk_audio = audio[start_ms:end_ms]
+        if not is_audio_usable(chunk_audio):
+            continue
+
+        tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        chunk_audio.export(tmp_path, format="wav")
+        try:
+            chunk_result = chunk_transcriber(tmp_path)
+            segments.extend(shifted_segments(chunk_result, start_ms))
+        except Exception as e:
+            if is_cuda_oom_error(e):
+                clear_cuda_cache()
+                if raise_cuda_oom:
+                    raise
+            print(
+                f"分块转写失败 {audio_path} {start_ms // 1000}-{end_ms // 1000}s: {e}",
+                flush=True,
+            )
+        finally:
+            os.unlink(tmp_path)
+
+    return {"segments": segments}
+
+
+def transcribe_with_chunking(audio_path, direct_transcriber):
+    try:
+        if ASR_CHUNK_SECONDS > 0:
+            return transcribe_by_fixed_chunks(audio_path, direct_transcriber, ASR_CHUNK_SECONDS)
+        return direct_transcriber(audio_path)
+    except Exception as e:
+        if not is_cuda_oom_error(e):
+            raise
+        clear_cuda_cache()
+        print(
+            f"CUDA OOM，改用 {ASR_OOM_CHUNK_SECONDS}s 小分块重试 {audio_path}: {e}",
+            flush=True,
+        )
+        return transcribe_by_fixed_chunks(
+            audio_path,
+            direct_transcriber,
+            ASR_OOM_CHUNK_SECONDS,
+            raise_cuda_oom=False,
+        )
+
+
 def transcribe_by_whisper_segments(audio_path, segment_transcriber):
     ws_result = whisper_timestamp_model.transcribe(audio_path)
     ws_segments = ws_result.get('segments', [])
@@ -546,9 +633,7 @@ elif ASR_MODEL == 'paraformer':
         pf_result = paraformer_model.generate(**generate_kwargs)
         return pf_result[0].get('text', '') if pf_result else ''
 
-    def transcribe(audio_path):
-        if ASR_SEGMENT_MODE == 'whisper':
-            return transcribe_by_whisper_segments(audio_path, transcribe_paraformer_segment)
+    def transcribe_paraformer_fast(audio_path):
         generate_kwargs = {'input': audio_path, 'batch_size_s': 300}
         if ASR_HOTWORDS:
             generate_kwargs['hotword'] = ASR_HOTWORDS
@@ -558,6 +643,11 @@ elif ASR_MODEL == 'paraformer':
         if ASR_OUTPUT_TIMESTAMP:
             return funasr_segments_from_result(pf_result)
         return format_plain_text_as_single_segment(funasr_text_from_result(pf_result))
+
+    def transcribe(audio_path):
+        if ASR_SEGMENT_MODE == 'whisper':
+            return transcribe_by_whisper_segments(audio_path, transcribe_paraformer_segment)
+        return transcribe_with_chunking(audio_path, transcribe_paraformer_fast)
 elif ASR_MODEL in ('sensevoice', 'sensevoice-small', 'sensevoicesmall'):
     log_stage('加载 SenseVoiceSmall 模型')
     sensevoice_model = AutoModel(
@@ -588,9 +678,7 @@ elif ASR_MODEL in ('sensevoice', 'sensevoice-small', 'sensevoicesmall'):
         sv_result = sensevoice_model.generate(**generate_kwargs)
         return clean_sensevoice_text(sv_result[0].get('text', '')) if sv_result else ''
 
-    def transcribe(audio_path):
-        if ASR_SEGMENT_MODE == 'whisper':
-            return transcribe_by_whisper_segments(audio_path, transcribe_sensevoice_segment)
+    def transcribe_sensevoice_fast(audio_path):
         generate_kwargs = {
             'input': audio_path,
             'cache': {},
@@ -609,6 +697,11 @@ elif ASR_MODEL in ('sensevoice', 'sensevoice-small', 'sensevoicesmall'):
             return funasr_segments_from_result(sv_result, clean_sensevoice_text)
         text = funasr_text_from_result(sv_result, clean_sensevoice_text)
         return format_plain_text_as_single_segment(text)
+
+    def transcribe(audio_path):
+        if ASR_SEGMENT_MODE == 'whisper':
+            return transcribe_by_whisper_segments(audio_path, transcribe_sensevoice_segment)
+        return transcribe_with_chunking(audio_path, transcribe_sensevoice_fast)
 else:
     raise SystemExit(f"不支持的 ASR_MODEL: {ASR_MODEL}")
 

@@ -31,8 +31,15 @@ ASR_OUTPUT_TIMESTAMP=1
 ASR_MAX_SEGMENT_CHARS=80
 ASR_MAX_SEGMENT_SECONDS=20
 
+# fast 模式长音频按固定秒数分块，遇到 CUDA OOM 时用更小分块重试
+ASR_CHUNK_SECONDS=180
+ASR_OOM_CHUNK_SECONDS=60
+
 # 可选：指定设备，例如 cpu、cuda:0、mps
 ASR_DEVICE=cpu
+
+# CUDA 显存分配策略，减少长时间运行后的碎片影响
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # 批量写库，减少 commit 次数
 INSERT_BATCH_SIZE=100
