@@ -21,6 +21,7 @@ import psycopg2
 import psycopg2.extras
 import pandas as pd
 from pydub import AudioSegment
+from pydub.silence import detect_silence
 import whisper
 from funasr import AutoModel
 try:
@@ -68,6 +69,9 @@ ASR_MAX_SEGMENT_CHARS = max(env_int('ASR_MAX_SEGMENT_CHARS', 80), 10)
 ASR_MAX_SEGMENT_SECONDS = max(env_int('ASR_MAX_SEGMENT_SECONDS', 20), 5)
 ASR_CHUNK_SECONDS = max(env_int('ASR_CHUNK_SECONDS', 180), 0)
 ASR_OOM_CHUNK_SECONDS = max(env_int('ASR_OOM_CHUNK_SECONDS', 60), 10)
+ASR_CHUNK_BOUNDARY_WINDOW_SECONDS = max(env_int('ASR_CHUNK_BOUNDARY_WINDOW_SECONDS', 30), 0)
+ASR_CHUNK_MIN_SILENCE_MS = max(env_int('ASR_CHUNK_MIN_SILENCE_MS', 600), 100)
+ASR_CHUNK_SILENCE_DB = max(env_int('ASR_CHUNK_SILENCE_DB', 16), 1)
 PARAFORMER_PUNC = env_bool('PARAFORMER_PUNC', True)
 SHARD_COUNT = max(env_int('SHARD_COUNT', 1), 1)
 SHARD_INDEX = env_int('SHARD_INDEX', 0)
@@ -450,16 +454,74 @@ def shifted_segments(result, offset_ms):
     return shifted
 
 
-def transcribe_by_fixed_chunks(audio_path, chunk_transcriber, chunk_seconds, raise_cuda_oom=True):
-    audio = AudioSegment.from_file(audio_path, format="wav")
+def silence_ranges(audio):
+    if not math.isfinite(audio.dBFS):
+        return [(0, len(audio))]
+    return detect_silence(
+        audio,
+        min_silence_len=ASR_CHUNK_MIN_SILENCE_MS,
+        silence_thresh=audio.dBFS - ASR_CHUNK_SILENCE_DB,
+        seek_step=100,
+    )
+
+
+def best_silence_cut(current_start, target_end, audio_len, silences):
+    if target_end >= audio_len:
+        return audio_len
+    window_ms = ASR_CHUNK_BOUNDARY_WINDOW_SECONDS * 1000
+    if window_ms <= 0:
+        return target_end
+
+    search_start = max(current_start + 1000, target_end - window_ms)
+    search_end = min(audio_len, target_end + window_ms)
+    candidates = []
+    for silence_start, silence_end in silences:
+        if silence_end <= search_start or silence_start >= search_end:
+            continue
+        overlap_start = max(silence_start, search_start)
+        overlap_end = min(silence_end, search_end)
+        if overlap_start >= overlap_end:
+            continue
+        cut = (overlap_start + overlap_end) // 2
+        candidates.append(cut)
+
+    if not candidates:
+        return target_end
+    return min(candidates, key=lambda cut: abs(cut - target_end))
+
+
+def audio_chunk_ranges(audio, chunk_seconds):
     chunk_ms = max(int(chunk_seconds * 1000), 1000)
-    if len(audio) <= chunk_ms:
+    audio_len = len(audio)
+    if audio_len <= chunk_ms:
+        return [(0, audio_len)]
+
+    silences = silence_ranges(audio)
+    ranges = []
+    start_ms = 0
+    while start_ms < audio_len:
+        target_end = start_ms + chunk_ms
+        end_ms = best_silence_cut(start_ms, target_end, audio_len, silences)
+        if end_ms <= start_ms:
+            end_ms = min(target_end, audio_len)
+        ranges.append((start_ms, end_ms))
+        start_ms = end_ms
+
+    return ranges
+
+
+def transcribe_by_audio_chunks(audio_path, chunk_transcriber, chunk_seconds, raise_cuda_oom=True):
+    audio = AudioSegment.from_file(audio_path, format="wav")
+    ranges = audio_chunk_ranges(audio, chunk_seconds)
+    if len(ranges) == 1:
         return chunk_transcriber(audio_path)
 
-    log_stage(f'长音频分块转写: {audio_path}, 时长 {len(audio) // 1000}s, 分块 {chunk_seconds}s')
+    log_stage(
+        f'长音频按停顿分块转写: {audio_path}, '
+        f'时长 {len(audio) // 1000}s, 目标分块 {chunk_seconds}s, 实际 {len(ranges)} 块'
+    )
     segments = []
-    for start_ms in range(0, len(audio), chunk_ms):
-        end_ms = min(start_ms + chunk_ms, len(audio))
+    for start_ms, end_ms in ranges:
         chunk_audio = audio[start_ms:end_ms]
         if not is_audio_usable(chunk_audio):
             continue
@@ -489,7 +551,7 @@ def transcribe_by_fixed_chunks(audio_path, chunk_transcriber, chunk_seconds, rai
 def transcribe_with_chunking(audio_path, direct_transcriber):
     try:
         if ASR_CHUNK_SECONDS > 0:
-            return transcribe_by_fixed_chunks(audio_path, direct_transcriber, ASR_CHUNK_SECONDS)
+            return transcribe_by_audio_chunks(audio_path, direct_transcriber, ASR_CHUNK_SECONDS)
         return direct_transcriber(audio_path)
     except Exception as e:
         if not is_cuda_oom_error(e):
@@ -499,7 +561,7 @@ def transcribe_with_chunking(audio_path, direct_transcriber):
             f"CUDA OOM，改用 {ASR_OOM_CHUNK_SECONDS}s 小分块重试 {audio_path}: {e}",
             flush=True,
         )
-        return transcribe_by_fixed_chunks(
+        return transcribe_by_audio_chunks(
             audio_path,
             direct_transcriber,
             ASR_OOM_CHUNK_SECONDS,
