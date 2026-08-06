@@ -115,12 +115,12 @@ wait
 
 ```bash
 HISTORY_START_DATE=2024-01-01 HISTORY_END_DATE=2024-06-01 ./run_history_smart.sh
-HISTORY_BATCH_DAYS=5 HISTORY_STOP_TIME=23:00 ./run_history_smart.sh
+HISTORY_BATCH_DAYS=5 HISTORY_STOP_TIME=23:30 HISTORY_RESUME_TIME=00:40 ./run_history_smart.sh
 ```
 
 这些 `HISTORY_*` 配置也可以写在 `.env` 里，让 `run_history_smart.sh` 和 `run_history_daemon.sh` 自动读取。
 
-每个窗口跑完后会再次检查是否还有未写入 `bi.call_to_text` 的记录；只有窗口清空才推进进度。若到达 `HISTORY_STOP_TIME` 或被中断，下次会继续当前窗口，已写入的数据会被自动跳过。
+每个窗口跑完后会再次检查是否还有未写入 `bi.call_to_text` 的记录；只有窗口清空才推进进度。历史任务会在 `HISTORY_STOP_TIME` 到 `HISTORY_RESUME_TIME` 的主任务保护窗口内暂停启动，避免抢占 00:10 的日常任务；若到点或被中断，下次会继续当前窗口，已写入的数据会被自动跳过。
 
 进度默认记录在 `/tmp/history_progress.txt`；全部完成后会写入 `/tmp/call_to_text_history.done`。如果需要重跑历史任务，先删除这两个文件。
 

@@ -21,7 +21,8 @@ MAIN_LOCK=${MAIN_LOCK:-/tmp/call_to_text.lock}
 HISTORY_LOG=${HISTORY_LOG:-logs/history_smart.log}
 ASR_MODEL=${ASR_MODEL:-sensevoice}
 ASR_DEVICE=${ASR_DEVICE:-cuda:0}
-HISTORY_STOP_TIME=${HISTORY_STOP_TIME:-23:00}
+HISTORY_STOP_TIME=${HISTORY_STOP_TIME:-23:30}
+HISTORY_RESUME_TIME=${HISTORY_RESUME_TIME:-00:40}
 MIN_BATCH_SECONDS=${HISTORY_MIN_BATCH_SECONDS:-600}
 RETRY_SLEEP_SECONDS=${HISTORY_RETRY_SLEEP_SECONDS:-1800}
 
@@ -53,11 +54,48 @@ is_positive_int() {
     [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
 
+time_to_minutes() {
+    local value=$1
+    if [[ ! "$value" =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
+        return 1
+    fi
+    local hour=${BASH_REMATCH[1]}
+    local minute=${BASH_REMATCH[2]}
+    if ((10#$hour > 23 || 10#$minute > 59)); then
+        return 1
+    fi
+    echo $((10#$hour * 60 + 10#$minute))
+}
+
+current_minutes() {
+    local hour minute
+    hour=$(date +%H)
+    minute=$(date +%M)
+    echo $((10#$hour * 60 + 10#$minute))
+}
+
+in_history_pause_window() {
+    local now stop resume
+    now=$(current_minutes)
+    stop=$(time_to_minutes "$HISTORY_STOP_TIME") || return 1
+    resume=$(time_to_minutes "$HISTORY_RESUME_TIME") || return 1
+
+    if ((stop < resume)); then
+        ((now >= stop || now < resume))
+    else
+        ((now >= stop && now < resume))
+    fi
+}
+
 seconds_until_stop() {
-    local now target
-    now=$(date +%s)
-    target=$(date -d "$(date +%F) $HISTORY_STOP_TIME:00" +%s)
-    echo $((target - now))
+    local now stop
+    now=$(current_minutes)
+    stop=$(time_to_minutes "$HISTORY_STOP_TIME")
+    if ((stop <= now)); then
+        echo 0
+    else
+        echo $(((stop - now) * 60))
+    fi
 }
 
 pending_count_for_window() {
@@ -143,8 +181,13 @@ if ! is_positive_int "$RETRY_SLEEP_SECONDS"; then
     exit 1
 fi
 
-if ! date -d "$(date +%F) $HISTORY_STOP_TIME:00" +%s >/dev/null 2>&1; then
+if ! time_to_minutes "$HISTORY_STOP_TIME" >/dev/null; then
     log "HISTORY_STOP_TIME 必须使用 HH:MM 格式"
+    exit 1
+fi
+
+if ! time_to_minutes "$HISTORY_RESUME_TIME" >/dev/null; then
+    log "HISTORY_RESUME_TIME 必须使用 HH:MM 格式"
     exit 1
 fi
 
@@ -176,6 +219,11 @@ fi
 log "========== 历史任务启动: $CURRENT_START -> $HISTORY_END_DATE, batch=${BATCH_DAYS}d =========="
 
 while true; do
+    if in_history_pause_window; then
+        log "处于主任务保护窗口 $HISTORY_STOP_TIME-$HISTORY_RESUME_TIME，退出等待下次恢复"
+        exit 0
+    fi
+
     CURRENT_START=$(cat "$STATE_FILE" 2>/dev/null || echo "$HISTORY_START_DATE")
 
     if [ "$(date_to_epoch "$CURRENT_START")" -ge "$(date_to_epoch "$HISTORY_END_DATE")" ]; then
