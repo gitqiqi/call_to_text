@@ -884,19 +884,6 @@ def flush_pending_rows():
                 print(f"单条写入失败 id={params[0]}: {row_error}")
                 conn.rollback()
 
-
-def append_empty_result(row_id, voice_id, from_id, receive_id, msg_type, msg_time,
-                        voice_length, content, url, model_suffix, duration_ms=0):
-    result_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    pending_rows.append((
-        row_id, voice_id, from_id, receive_id, msg_type, msg_time,
-        voice_length, content, url, '', '', '',
-        result_time, result_time, duration_ms, f'{model_name}-{model_suffix}'
-    ))
-    if len(pending_rows) >= INSERT_BATCH_SIZE:
-        flush_pending_rows()
-
-
 for _, row in df.iterrows():
     row_id = row['id']
     record_paths = []
@@ -939,29 +926,34 @@ for _, row in df.iterrows():
             print(f"进度: 已处理 {processed + len(pending_rows)}/{len(df)}")
     except PermanentRecordError as e:
         failed += 1
-        append_empty_result(
+        error_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        raw_url = row['voice_url']
+        pending_rows.append((
             row_id, voice_id, from_id, receive_id, msg_type, msg_time,
-            voice_length, content, row['voice_url'], 'invalid-url'
-        )
+            voice_length, content, raw_url, '', '', '',
+            error_time, error_time, 0, f'{model_name}-invalid-url'
+        ))
+        if len(pending_rows) >= INSERT_BATCH_SIZE:
+            flush_pending_rows()
         print(f"无效音频 URL id={row_id}: {e}，已写入空结果并跳过后续重试", flush=True)
         conn.rollback()
     except RecordTimeoutError as e:
         failed += 1
         clear_cuda_cache()
+        timeout_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         timeout_duration_ms = RECORD_TIMEOUT_SECONDS * 1000
-        append_empty_result(
+        pending_rows.append((
             row_id, voice_id, from_id, receive_id, msg_type, msg_time,
-            voice_length, content, url, 'timeout', timeout_duration_ms
-        )
+            voice_length, content, url, '', '', '',
+            timeout_time, timeout_time, timeout_duration_ms, f'{model_name}-timeout'
+        ))
+        if len(pending_rows) >= INSERT_BATCH_SIZE:
+            flush_pending_rows()
         print(f"处理超时 {e}，已写入空结果并跳过后续重试", flush=True)
         conn.rollback()
     except CouldntDecodeError as e:
         failed += 1
-        append_empty_result(
-            row_id, voice_id, from_id, receive_id, msg_type, msg_time,
-            voice_length, content, url, 'decode-error'
-        )
-        print(f"音频解码失败 id={row_id} format={audio_format}: {e}，已写入空结果并跳过后续重试", flush=True)
+        print(f"音频解码失败 id={row_id} format={audio_format}: {e}")
         conn.rollback()
     except Exception as e:
         failed += 1
