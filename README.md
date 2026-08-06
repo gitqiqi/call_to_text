@@ -32,12 +32,14 @@ ASR_MAX_SEGMENT_CHARS=80
 ASR_MAX_SEGMENT_SECONDS=20
 
 # fast 模式遇到 CUDA OOM 时用小分块重试；日常任务默认不主动预分块
-# 历史补跑可用 HISTORY_ASR_CHUNK_SECONDS 开启主动分块
 ASR_CHUNK_SECONDS=0
 ASR_OOM_CHUNK_SECONDS=60
 ASR_CHUNK_BOUNDARY_WINDOW_SECONDS=30
 ASR_CHUNK_MIN_SILENCE_MS=600
 ASR_CHUNK_SILENCE_DB=16
+
+# 单条记录处理超时秒数，0 表示不限时；历史补跑默认单条 600 秒
+RECORD_TIMEOUT_SECONDS=0
 
 # 可选：指定设备，例如 cpu、cuda:0、mps
 ASR_DEVICE=cpu
@@ -116,7 +118,7 @@ wait
 ```bash
 HISTORY_START_DATE=2024-01-01 HISTORY_END_DATE=2024-06-01 ./run_history_smart.sh
 HISTORY_BATCH_DAYS=5 HISTORY_STOP_TIME=23:30 HISTORY_RESUME_TIME=00:40 ./run_history_smart.sh
-HISTORY_ASR_CHUNK_SECONDS=180 ./run_history_smart.sh
+HISTORY_RECORD_TIMEOUT_SECONDS=600 ./run_history_smart.sh
 ```
 
 这些 `HISTORY_*` 配置也可以写在 `.env` 里，让 `run_history_smart.sh` 和 `run_history_daemon.sh` 自动读取。

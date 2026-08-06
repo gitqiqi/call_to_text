@@ -36,6 +36,7 @@ import re
 import time
 import math
 import shutil
+import signal
 
 warnings.filterwarnings('ignore')
 
@@ -59,6 +60,7 @@ COUNT_PENDING_ONLY = env_bool('COUNT_PENDING_ONLY', False)
 INSERT_BATCH_SIZE = max(env_int('INSERT_BATCH_SIZE', 100), 1)
 DOWNLOAD_CHUNK_SIZE = max(env_int('DOWNLOAD_CHUNK_SIZE', 1024 * 1024), 1024)
 DOWNLOAD_RETRIES = max(env_int('DOWNLOAD_RETRIES', 3), 1)
+RECORD_TIMEOUT_SECONDS = max(env_int('RECORD_TIMEOUT_SECONDS', 0), 0)
 KEEP_AUDIO = env_bool('KEEP_AUDIO', False)
 CLEANUP_AUDIO_HOURS = max(env_int('CLEANUP_AUDIO_HOURS', 24), 0)
 PROGRESS_EVERY = max(env_int('PROGRESS_EVERY', 0), 0)
@@ -81,6 +83,35 @@ if SHARD_COUNT > 1 and not 0 <= SHARD_INDEX < SHARD_COUNT:
 def log_stage(message):
     if LOG_STAGES:
         print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {message}", flush=True)
+
+
+class RecordTimeoutError(TimeoutError):
+    pass
+
+
+class record_timeout:
+    def __init__(self, seconds, record_id):
+        self.seconds = seconds
+        self.record_id = record_id
+        self.enabled = seconds > 0 and hasattr(signal, 'SIGALRM') and hasattr(signal, 'setitimer')
+        self.previous_handler = None
+
+    def __enter__(self):
+        if not self.enabled:
+            return
+        self.previous_handler = signal.getsignal(signal.SIGALRM)
+
+        def handle_timeout(signum, frame):
+            raise RecordTimeoutError(f"id={self.record_id} 单条处理超过 {self.seconds} 秒")
+
+        signal.signal(signal.SIGALRM, handle_timeout)
+        signal.setitimer(signal.ITIMER_REAL, self.seconds)
+
+    def __exit__(self, exc_type, exc, traceback):
+        if self.enabled:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, self.previous_handler)
+        return False
 
 
 def parse_date(name, value):
@@ -836,13 +867,14 @@ for _, row in df.iterrows():
         if LOG_RECORDS:
             print('正在处理:', url)
 
-        os.makedirs(RUN_AUDIO_DIR, exist_ok=True)
-        audio_path = record_paths[0]
-        downloaded_file(url, audio_path)
-        stereo_audio = AudioSegment.from_file(audio_path, format="mp3")
-        transcribe_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        transcribe_perf_start = time.perf_counter()
-        text1, text2, text = result_texts(stereo_audio, row_id, RUN_AUDIO_DIR)
+        with record_timeout(RECORD_TIMEOUT_SECONDS, row_id):
+            os.makedirs(RUN_AUDIO_DIR, exist_ok=True)
+            audio_path = record_paths[0]
+            downloaded_file(url, audio_path)
+            stereo_audio = AudioSegment.from_file(audio_path, format="mp3")
+            transcribe_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            transcribe_perf_start = time.perf_counter()
+            text1, text2, text = result_texts(stereo_audio, row_id, RUN_AUDIO_DIR)
         transcribe_duration_ms = int((time.perf_counter() - transcribe_perf_start) * 1000)
         transcribe_end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -857,6 +889,20 @@ for _, row in df.iterrows():
             flush_pending_rows()
         if PROGRESS_EVERY and (processed + len(pending_rows)) % PROGRESS_EVERY == 0:
             print(f"进度: 已处理 {processed + len(pending_rows)}/{len(df)}")
+    except RecordTimeoutError as e:
+        failed += 1
+        clear_cuda_cache()
+        timeout_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        timeout_duration_ms = RECORD_TIMEOUT_SECONDS * 1000
+        pending_rows.append((
+            row_id, voice_id, from_id, receive_id, msg_type, msg_time,
+            voice_length, content, url, '', '', '',
+            timeout_time, timeout_time, timeout_duration_ms, f'{model_name}-timeout'
+        ))
+        if len(pending_rows) >= INSERT_BATCH_SIZE:
+            flush_pending_rows()
+        print(f"处理超时 {e}，已写入空结果并跳过后续重试", flush=True)
+        conn.rollback()
     except Exception as e:
         failed += 1
         print(f"处理失败 id={row_id}: {e}")
