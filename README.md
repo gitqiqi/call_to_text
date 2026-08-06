@@ -41,6 +41,9 @@ ASR_CHUNK_SILENCE_DB=16
 # 单条记录处理超时秒数，0 表示不限时；历史补跑默认单条 600 秒
 RECORD_TIMEOUT_SECONDS=0
 
+# 音频实际时长超过多少秒直接跳过，0 表示不限；历史补跑默认 600 秒
+MAX_RECORD_AUDIO_SECONDS=0
+
 # 可选：指定设备，例如 cpu、cuda:0、mps
 ASR_DEVICE=cpu
 
@@ -118,7 +121,7 @@ wait
 ```bash
 HISTORY_START_DATE=2024-01-01 HISTORY_END_DATE=2024-06-01 ./run_history_smart.sh
 HISTORY_BATCH_DAYS=5 HISTORY_STOP_TIME=23:30 HISTORY_RESUME_TIME=00:40 ./run_history_smart.sh
-HISTORY_RECORD_TIMEOUT_SECONDS=600 ./run_history_smart.sh
+HISTORY_RECORD_TIMEOUT_SECONDS=600 HISTORY_MAX_RECORD_AUDIO_SECONDS=600 ./run_history_smart.sh
 ```
 
 这些 `HISTORY_*` 配置也可以写在 `.env` 里，让 `run_history_smart.sh` 和 `run_history_daemon.sh` 自动读取。
@@ -129,9 +132,20 @@ HISTORY_RECORD_TIMEOUT_SECONDS=600 ./run_history_smart.sh
 
 ## 数据库字段
 
-脚本会写入每条音频的转写耗时，单位毫秒：
+脚本会写入每条音频的转写耗时和处理状态：
 
 ```sql
 ALTER TABLE bi.call_to_text
 ADD COLUMN IF NOT EXISTS transcribe_duration_ms bigint;
+
+ALTER TABLE bi.call_to_text
+ADD COLUMN IF NOT EXISTS transcribe_status text;
 ```
+
+`transcribe_status` 常见值：
+
+- `success`：转写成功
+- `timeout`：单条处理超时，已写入空结果避免反复重试
+- `decode-error`：音频文件下载后无法解码，通常是文件损坏或格式异常
+- `skipped-long-audio`：音频超过 `MAX_RECORD_AUDIO_SECONDS`，历史补跑默认跳过
+- `invalid-url`：音频 URL 为空或无效

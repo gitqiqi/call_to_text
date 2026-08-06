@@ -63,6 +63,7 @@ INSERT_BATCH_SIZE = max(env_int('INSERT_BATCH_SIZE', 100), 1)
 DOWNLOAD_CHUNK_SIZE = max(env_int('DOWNLOAD_CHUNK_SIZE', 1024 * 1024), 1024)
 DOWNLOAD_RETRIES = max(env_int('DOWNLOAD_RETRIES', 3), 1)
 RECORD_TIMEOUT_SECONDS = max(env_int('RECORD_TIMEOUT_SECONDS', 0), 0)
+MAX_RECORD_AUDIO_SECONDS = max(env_int('MAX_RECORD_AUDIO_SECONDS', 0), 0)
 KEEP_AUDIO = env_bool('KEEP_AUDIO', False)
 CLEANUP_AUDIO_HOURS = max(env_int('CLEANUP_AUDIO_HOURS', 24), 0)
 PROGRESS_EVERY = max(env_int('PROGRESS_EVERY', 0), 0)
@@ -840,9 +841,9 @@ INSERT INTO bi.call_to_text
 (id, voice_id, from_id, receive_id, msg_type, msg_time, voice_length,
  content, voice_url, left_channel_text, right_channel_text,
  all_channel_text, transcribe_start_time, transcribe_end_time,
- transcribe_duration_ms, model)
+ transcribe_duration_ms, model, transcribe_status)
 VALUES
-(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (id) DO UPDATE SET
     voice_id = EXCLUDED.voice_id,
     from_id = EXCLUDED.from_id,
@@ -858,7 +859,8 @@ ON CONFLICT (id) DO UPDATE SET
     transcribe_start_time = EXCLUDED.transcribe_start_time,
     transcribe_end_time = EXCLUDED.transcribe_end_time,
     transcribe_duration_ms = EXCLUDED.transcribe_duration_ms,
-    model = EXCLUDED.model
+    model = EXCLUDED.model,
+    transcribe_status = EXCLUDED.transcribe_status
 """
 
 def flush_pending_rows():
@@ -884,6 +886,19 @@ def flush_pending_rows():
                 print(f"单条写入失败 id={params[0]}: {row_error}")
                 conn.rollback()
 
+
+def append_empty_result(row_id, voice_id, from_id, receive_id, msg_type, msg_time,
+                        voice_length, content, voice_url, duration_ms, transcribe_status):
+    result_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    pending_rows.append((
+        row_id, voice_id, from_id, receive_id, msg_type, msg_time,
+        voice_length, content, voice_url, '', '', '',
+        result_time, result_time, duration_ms, model_name, transcribe_status
+    ))
+    if len(pending_rows) >= INSERT_BATCH_SIZE:
+        flush_pending_rows()
+
+
 for _, row in df.iterrows():
     row_id = row['id']
     record_paths = []
@@ -907,6 +922,19 @@ for _, row in df.iterrows():
             downloaded_file(url, audio_path)
             audio_format = audio_format_from_path(audio_path)
             stereo_audio = AudioSegment.from_file(audio_path, format=audio_format)
+            audio_seconds = len(stereo_audio) / 1000
+            if MAX_RECORD_AUDIO_SECONDS and audio_seconds > MAX_RECORD_AUDIO_SECONDS:
+                failed += 1
+                append_empty_result(
+                    row_id, voice_id, from_id, receive_id, msg_type, msg_time,
+                    voice_length, content, url, 0, 'skipped-long-audio'
+                )
+                print(
+                    f"音频过长跳过 id={row_id}: 时长 {audio_seconds:.1f}s > "
+                    f"{MAX_RECORD_AUDIO_SECONDS}s，已写入空结果并跳过后续重试",
+                    flush=True,
+                )
+                continue
             transcribe_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             transcribe_perf_start = time.perf_counter()
             text1, text2, text = result_texts(stereo_audio, row_id, RUN_AUDIO_DIR)
@@ -916,7 +944,8 @@ for _, row in df.iterrows():
         params = (
             row_id, voice_id, from_id, receive_id, msg_type, msg_time,
             voice_length, content, url, text1, text2, text,
-            transcribe_start_time, transcribe_end_time, transcribe_duration_ms, model_name
+            transcribe_start_time, transcribe_end_time, transcribe_duration_ms,
+            model_name, 'success'
         )
 
         pending_rows.append(params)
@@ -926,34 +955,30 @@ for _, row in df.iterrows():
             print(f"进度: 已处理 {processed + len(pending_rows)}/{len(df)}")
     except PermanentRecordError as e:
         failed += 1
-        error_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         raw_url = row['voice_url']
-        pending_rows.append((
+        append_empty_result(
             row_id, voice_id, from_id, receive_id, msg_type, msg_time,
-            voice_length, content, raw_url, '', '', '',
-            error_time, error_time, 0, f'{model_name}-invalid-url'
-        ))
-        if len(pending_rows) >= INSERT_BATCH_SIZE:
-            flush_pending_rows()
+            voice_length, content, raw_url, 0, 'invalid-url'
+        )
         print(f"无效音频 URL id={row_id}: {e}，已写入空结果并跳过后续重试", flush=True)
         conn.rollback()
     except RecordTimeoutError as e:
         failed += 1
         clear_cuda_cache()
-        timeout_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         timeout_duration_ms = RECORD_TIMEOUT_SECONDS * 1000
-        pending_rows.append((
+        append_empty_result(
             row_id, voice_id, from_id, receive_id, msg_type, msg_time,
-            voice_length, content, url, '', '', '',
-            timeout_time, timeout_time, timeout_duration_ms, f'{model_name}-timeout'
-        ))
-        if len(pending_rows) >= INSERT_BATCH_SIZE:
-            flush_pending_rows()
+            voice_length, content, url, timeout_duration_ms, 'timeout'
+        )
         print(f"处理超时 {e}，已写入空结果并跳过后续重试", flush=True)
         conn.rollback()
     except CouldntDecodeError as e:
         failed += 1
-        print(f"音频解码失败 id={row_id} format={audio_format}: {e}")
+        append_empty_result(
+            row_id, voice_id, from_id, receive_id, msg_type, msg_time,
+            voice_length, content, url, 0, 'decode-error'
+        )
+        print(f"音频解码失败 id={row_id} format={audio_format}: {e}，已写入空结果并跳过后续重试", flush=True)
         conn.rollback()
     except Exception as e:
         failed += 1
