@@ -21,6 +21,7 @@ import psycopg2
 import psycopg2.extras
 import pandas as pd
 from pydub import AudioSegment
+from pydub.exceptions import CouldntDecodeError
 from pydub.silence import detect_silence
 import whisper
 from funasr import AutoModel
@@ -37,6 +38,7 @@ import time
 import math
 import shutil
 import signal
+from urllib.parse import urlparse
 
 warnings.filterwarnings('ignore')
 
@@ -89,6 +91,10 @@ class RecordTimeoutError(TimeoutError):
     pass
 
 
+class PermanentRecordError(Exception):
+    pass
+
+
 class record_timeout:
     def __init__(self, seconds, record_id):
         self.seconds = seconds
@@ -138,11 +144,37 @@ def resolve_date_range():
 
 AUDIO_ROOT = os.getenv('AUDIO_DIR', 'MP3')
 RUN_AUDIO_DIR = os.path.join(AUDIO_ROOT, f'run_{os.getpid()}')
+AUDIO_SOURCE_EXTENSIONS = {'.mp3', '.amr', '.wav', '.m4a', '.aac', '.ogg', '.opus', '.flac', '.webm'}
 
 
-def record_audio_paths(record_id, host_path):
+def normalize_audio_url(value):
+    if value is None or pd.isna(value):
+        raise PermanentRecordError("音频 URL 为空")
+    url = str(value).strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        raise PermanentRecordError(f"音频 URL 无效: {value}")
+    return url
+
+
+def audio_extension_from_url(url):
+    ext = os.path.splitext(urlparse(url).path)[1].lower()
+    if ext in AUDIO_SOURCE_EXTENSIONS:
+        return ext
+    return '.mp3'
+
+
+def audio_format_from_path(path):
+    ext = os.path.splitext(path)[1].lower().lstrip('.')
+    if ext == 'm4a':
+        return 'mp4'
+    return ext or None
+
+
+def record_audio_paths(record_id, host_path, source_url):
+    source_ext = audio_extension_from_url(source_url)
     return [
-        os.path.join(host_path, f'{record_id}.mp3'),
+        os.path.join(host_path, f'{record_id}{source_ext}'),
         os.path.join(host_path, f'{record_id}_left.wav'),
         os.path.join(host_path, f'{record_id}_right.wav'),
     ]
@@ -164,7 +196,7 @@ def cleanup_stale_audio(root_dir, max_age_hours):
     removed = 0
     for current_dir, _, files in os.walk(root_dir, topdown=False):
         for file_name in files:
-            if not file_name.lower().endswith(('.mp3', '.wav')):
+            if not file_name.lower().endswith(('.mp3', '.amr', '.wav', '.m4a', '.aac', '.ogg', '.opus', '.flac', '.webm')):
                 continue
             path = os.path.join(current_dir, file_name)
             try:
@@ -854,9 +886,9 @@ def flush_pending_rows():
 
 for _, row in df.iterrows():
     row_id = row['id']
-    record_paths = record_audio_paths(row_id, RUN_AUDIO_DIR)
+    record_paths = []
+    audio_format = None
     try:
-        url = row['voice_url']
         msg_type = row['msg_type']
         msg_time = row['msg_time']
         from_id = row['from_id']
@@ -864,14 +896,17 @@ for _, row in df.iterrows():
         content = row['content']
         voice_id = row['voice_id']
         voice_length = normalize_int(row['voice_length'])
+        url = normalize_audio_url(row['voice_url'])
         if LOG_RECORDS:
             print('正在处理:', url)
 
         with record_timeout(RECORD_TIMEOUT_SECONDS, row_id):
             os.makedirs(RUN_AUDIO_DIR, exist_ok=True)
+            record_paths = record_audio_paths(row_id, RUN_AUDIO_DIR, url)
             audio_path = record_paths[0]
             downloaded_file(url, audio_path)
-            stereo_audio = AudioSegment.from_file(audio_path, format="mp3")
+            audio_format = audio_format_from_path(audio_path)
+            stereo_audio = AudioSegment.from_file(audio_path, format=audio_format)
             transcribe_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             transcribe_perf_start = time.perf_counter()
             text1, text2, text = result_texts(stereo_audio, row_id, RUN_AUDIO_DIR)
@@ -889,6 +924,19 @@ for _, row in df.iterrows():
             flush_pending_rows()
         if PROGRESS_EVERY and (processed + len(pending_rows)) % PROGRESS_EVERY == 0:
             print(f"进度: 已处理 {processed + len(pending_rows)}/{len(df)}")
+    except PermanentRecordError as e:
+        failed += 1
+        error_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        raw_url = row['voice_url']
+        pending_rows.append((
+            row_id, voice_id, from_id, receive_id, msg_type, msg_time,
+            voice_length, content, raw_url, '', '', '',
+            error_time, error_time, 0, f'{model_name}-invalid-url'
+        ))
+        if len(pending_rows) >= INSERT_BATCH_SIZE:
+            flush_pending_rows()
+        print(f"无效音频 URL id={row_id}: {e}，已写入空结果并跳过后续重试", flush=True)
+        conn.rollback()
     except RecordTimeoutError as e:
         failed += 1
         clear_cuda_cache()
@@ -902,6 +950,10 @@ for _, row in df.iterrows():
         if len(pending_rows) >= INSERT_BATCH_SIZE:
             flush_pending_rows()
         print(f"处理超时 {e}，已写入空结果并跳过后续重试", flush=True)
+        conn.rollback()
+    except CouldntDecodeError as e:
+        failed += 1
+        print(f"音频解码失败 id={row_id} format={audio_format}: {e}")
         conn.rollback()
     except Exception as e:
         failed += 1
